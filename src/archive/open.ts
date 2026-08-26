@@ -10,6 +10,7 @@ import {
   type DetectionResult,
   zipIsEncrypted,
 } from "./detect";
+import { decompressBzip2 } from "./bzip2";
 import { decompressGzip } from "./gzip";
 import { TarAdapter } from "./tar";
 import type {
@@ -20,6 +21,8 @@ import type {
   OpenedArchive,
 } from "./types";
 import { ZipAdapter } from "./zip";
+import { decompressXz } from "./xz";
+import { decompressZstd } from "./zstd";
 
 export interface ResolvedResource {
   detection: Omit<DetectionResult, "format"> & { format: string };
@@ -138,6 +141,9 @@ export async function resolveResource(
 
   let decompressed: ByteStream;
   if (outer.format === "gzip") decompressed = decompressGzip(outerPeek.byteStream);
+  else if (outer.format === "bzip2") decompressed = decompressBzip2(outerPeek.byteStream);
+  else if (outer.format === "xz") decompressed = decompressXz(outerPeek.byteStream);
+  else if (outer.format === "zstd") decompressed = decompressZstd(outerPeek.byteStream);
   else unsupportedCompression(outer.format);
 
   let innerPeek: Awaited<ReturnType<typeof peekByteStream>>;
@@ -156,7 +162,15 @@ export async function resolveResource(
     return {
       detection: {
         kind: "archive",
-        format: `tar.${outer.format === "gzip" ? "gz" : outer.format}`,
+        format: `tar.${
+          outer.format === "gzip"
+            ? "gz"
+            : outer.format === "bzip2"
+              ? "bz2"
+              : outer.format === "zstd"
+                ? "zst"
+                : outer.format
+        }`,
         layers: [outer.format, "tar"],
         source: inner.source,
       },

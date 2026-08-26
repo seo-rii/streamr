@@ -1,0 +1,22 @@
+diff --git a/node_modules/fzstd/esm/index.mjs b/node_modules/fzstd/esm/index.mjs
+index 5d3c01b..526dc8c 100644
+--- a/node_modules/fzstd/esm/index.mjs
++++ b/node_modules/fzstd/esm/index.mjs
+@@ -48,7 +48,7 @@ export var ZstdErrorCode = {
+ // error codes
+ var ec = [
+     'invalid zstd data',
+-    'window size too large (>2046MB)',
++    'window size too large (>32MB)',
+     'invalid block type',
+     'FSE accuracy too high',
+     'match distance too far back',
+@@ -98,7 +98,7 @@ var rzfh = function (dat, w) {
+             var wb = 1 << (10 + (dat[5] >> 3));
+             ws = wb + (wb >> 3) * (dat[5] & 7);
+         }
+-        if (ws > 2145386496)
++        if (ws > 33554432)
+             err(1);
+         var buf = new u8((w == 1 ? (fss || ws) : w ? 0 : ws) + 12);
+         buf[0] = 1, buf[4] = 4, buf[8] = 8;
