@@ -1,14 +1,23 @@
 import { requireBearer } from "./auth";
+import { openArchive } from "./archive/open";
+import {
+  assertUniqueSelectors,
+  listOpenedArchive,
+  selectSingleEntry,
+  selectorOccurrencePaths,
+} from "./archive/select";
 import { GatewayError, asGatewayError, errorResponse } from "./errors";
 import { rawResponse } from "./outputs/raw-response";
 import { uploadByteStream } from "./outputs/transfer";
 import {
   parseSchema,
+  listRequestSchema,
   probeRequestSchema,
   streamRequestSchema,
   transferRequestSchema,
 } from "./schemas";
 import { fetchSource } from "./source/fetch";
+import type { FetchedSource } from "./source/fetch";
 import { probeSource } from "./source/probe";
 import { readJsonRequest } from "./util/json";
 import { logRequest, requestId, safeUrlParts } from "./util/logging";
@@ -22,17 +31,20 @@ const AUTHENTICATED_POST_ROUTES = new Set([
   "/v1/distribute",
 ]);
 
-function requireRawPipeline(input: {
-  archive?: unknown;
+function detectionHints(source: FetchedSource) {
+  return {
+    url: source.finalUrl,
+    ...(source.contentType === undefined ? {} : { contentType: source.contentType }),
+  };
+}
+
+function requireNoTransforms(input: {
   entryTransforms: readonly unknown[];
   finalTransforms?: readonly unknown[];
-  output?: { mode: "raw" | "multipart-mixed" };
 }): void {
   if (
-    input.archive !== undefined ||
     input.entryTransforms.length !== 0 ||
-    (input.finalTransforms?.length ?? 0) !== 0 ||
-    input.output?.mode === "multipart-mixed"
+    (input.finalTransforms?.length ?? 0) !== 0
   ) {
     throw new GatewayError(
       "INVALID_REQUEST",
@@ -50,22 +62,92 @@ async function handleProbe(request: Request): Promise<Response> {
   });
 }
 
-async function handleRawStream(request: Request): Promise<Response> {
+async function handleList(request: Request): Promise<Response> {
   const value = await readJsonRequest(request);
-  const input = parseSchema(streamRequestSchema, value);
-  requireRawPipeline(input);
+  const input = parseSchema(listRequestSchema, value);
   const source = await fetchSource(input.source, request.signal);
-  return rawResponse(source.byteStream, input.output);
+  try {
+    const archive = await openArchive(
+      source.byteStream,
+      detectionHints(source),
+      { listMode: true },
+    );
+    const listed = await listOpenedArchive(archive, input.options.maxEntries);
+    return Response.json(
+      {
+        ok: true,
+        format: archive.format,
+        layers: archive.layers,
+        entries: listed.entries,
+        truncated: listed.truncated,
+        sourceGets: source.stats.sourceGets,
+      },
+      { headers: { "Cache-Control": "no-store" } },
+    );
+  } catch (error) {
+    source.byteStream.abort(error);
+    throw error;
+  }
 }
 
-async function handleRawTransfer(request: Request): Promise<Response> {
+async function handleStream(request: Request): Promise<Response> {
+  const value = await readJsonRequest(request);
+  const input = parseSchema(streamRequestSchema, value);
+  requireNoTransforms(input);
+  const source = await fetchSource(input.source, request.signal);
+  if (input.archive === undefined) {
+    if (input.output.mode !== "raw") {
+      source.byteStream.abort("raw sources cannot produce multipart output");
+      throw new GatewayError("INVALID_REQUEST", "A raw source requires raw output mode.", {
+        stage: "pipeline-validate",
+      });
+    }
+    return rawResponse(source.byteStream, input.output);
+  }
+
+  assertUniqueSelectors(input.archive.entries);
+  if (input.output.mode !== "raw" || input.archive.entries.length !== 1) {
+    source.byteStream.abort("multi-entry output is not raw");
+    throw new GatewayError("INVALID_REQUEST", "Raw output requires exactly one archive entry.", {
+      stage: "pipeline-validate",
+    });
+  }
+  const archive = await openArchive(
+    source.byteStream,
+    detectionHints(source),
+    { occurrencePaths: selectorOccurrencePaths(input.archive.entries) },
+  );
+  const selected = await selectSingleEntry(archive, input.archive.entries[0]!);
+  return rawResponse(selected.byteStream, input.output);
+}
+
+async function handleTransfer(request: Request): Promise<Response> {
   const value = await readJsonRequest(request);
   const input = parseSchema(transferRequestSchema, value);
-  requireRawPipeline(input);
+  requireNoTransforms(input);
   const source = await fetchSource(input.source, request.signal);
 
   try {
-    const result = await uploadByteStream(source.byteStream, input.target, request.signal);
+    let byteStream = source.byteStream;
+    if (input.archive !== undefined) {
+      assertUniqueSelectors(input.archive.entries);
+      if (input.archive.entries.length !== 1) {
+        throw new GatewayError(
+          "INVALID_REQUEST",
+          "A transfer requires exactly one archive entry.",
+          { stage: "pipeline-validate" },
+        );
+      }
+      const archive = await openArchive(
+        source.byteStream,
+        detectionHints(source),
+        { occurrencePaths: selectorOccurrencePaths(input.archive.entries) },
+      );
+      byteStream = (
+        await selectSingleEntry(archive, input.archive.entries[0]!)
+      ).byteStream;
+    }
+    const result = await uploadByteStream(byteStream, input.target, request.signal);
     return Response.json(
       {
         ok: true,
@@ -109,13 +191,11 @@ export async function routeRequest(
     let response: Response;
     if (url.pathname === "/v1/probe") response = await handleProbe(request);
     else if (url.pathname === "/v1/stream" && request.method === "POST") {
-      response = await handleRawStream(request);
+      response = await handleStream(request);
     } else if (url.pathname === "/v1/transfer") {
-      response = await handleRawTransfer(request);
+      response = await handleTransfer(request);
     } else if (url.pathname === "/v1/list") {
-      throw new GatewayError("NOT_AN_ARCHIVE", "Archive listing is not available for a raw stream.", {
-        stage: "archive-detect",
-      });
+      response = await handleList(request);
     } else if (url.pathname === "/v1/distribute") {
       throw new GatewayError("NOT_AN_ARCHIVE", "Archive distribution requires an archive source.", {
         stage: "archive-detect",
@@ -162,4 +242,3 @@ export async function routeRequest(
     return errorResponse(gatewayError, id);
   }
 }
-

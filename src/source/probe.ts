@@ -1,15 +1,14 @@
-import { LIMITS } from "../constants";
+import { resolveResource } from "../archive/open";
 import type { SourceSpec } from "../schemas";
-import { peekByteStream } from "../streams/peek";
 import { fetchSource } from "./fetch";
 
 export async function probeSource(spec: SourceSpec, signal?: AbortSignal) {
   const source = await fetchSource(spec, signal);
-  const { prefix, byteStream } = await peekByteStream(
-    source.byteStream,
-    LIMITS.prefixBytes,
-  );
-  await byteStream.stream.cancel("probe complete");
+  const resolved = await resolveResource(source.byteStream, {
+    url: source.finalUrl,
+    ...(source.contentType === undefined ? {} : { contentType: source.contentType }),
+  });
+  await resolved.byteStream.stream.cancel("probe complete");
 
   return {
     ok: true as const,
@@ -20,10 +19,10 @@ export async function probeSource(spec: SourceSpec, signal?: AbortSignal) {
       ? {}
       : { contentLength: source.contentLength }),
     detected: {
-      kind: "file" as const,
-      format: "raw" as const,
-      layers: [] as string[],
+      kind: resolved.detection.kind,
+      format: resolved.detection.format,
+      layers: resolved.detection.layers,
     },
-    prefixBytesRead: prefix.byteLength,
+    prefixBytesRead: resolved.prefixBytesRead,
   };
 }

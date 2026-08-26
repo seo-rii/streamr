@@ -1,0 +1,65 @@
+diff --git a/node_modules/fflate/esm/browser.d.ts b/node_modules/fflate/esm/browser.d.ts
+index d430faf..badb950 100644
+--- a/node_modules/fflate/esm/browser.d.ts
++++ b/node_modules/fflate/esm/browser.d.ts
+@@ -1425,6 +1425,14 @@ export interface UnzipFile {
+      * decompression stream available for this method, start() will throw.
+      */
+     compression: number;
++    /** General-purpose flags from the local file header. */
++    flags: number;
++    /** Whether the local file header marks this entry as encrypted. */
++    encrypted: boolean;
++    /** Whether the local file header uses a trailing data descriptor. */
++    usesDataDescriptor: boolean;
++    /** Expected CRC-32 once it is known from the local header or descriptor. */
++    crc?: number;
+     /**
+      * The compressed size of the file. Will not be present for archives created
+      * in a streaming fashion.
+diff --git a/node_modules/fflate/esm/browser.js b/node_modules/fflate/esm/browser.js
+index 82af0fd..817309f 100644
+--- a/node_modules/fflate/esm/browser.js
++++ b/node_modules/fflate/esm/browser.js
+@@ -2455,11 +2455,13 @@ var Unzip = /*#__PURE__*/ (function () {
+             var l = buf.length, oc = this.c, add = oc && this.d;
+             var _loop_2 = function () {
+                 var sig = b4(buf, i);
++                if (oc < 0 && (sig == 0x4034B50 || sig == 0x2014B50) && this_1.f)
++                    this_1.f.crc = b4(buf, i - 12 - (oc == -2 && 8));
+                 if (sig == 0x4034B50) {
+                     f = 1, is = i;
+                     this_1.d = null;
+                     this_1.c = 0;
+-                    var bf = b2(buf, i + 6), cmp_1 = b2(buf, i + 8), u = bf & 2048, dd = bf & 8, fnl = b2(buf, i + 26), es = b2(buf, i + 28);
++                    var bf = b2(buf, i + 6), cmp_1 = b2(buf, i + 8), u = bf & 2048, dd = bf & 8, crc_1 = b4(buf, i + 14), fnl = b2(buf, i + 26), es = b2(buf, i + 28);
+                     if (l > i + 30 + fnl + es) {
+                         var chks_3 = [];
+                         this_1.k.unshift(chks_3);
+@@ -2475,6 +2477,10 @@ var Unzip = /*#__PURE__*/ (function () {
+                         var file_1 = {
+                             name: fn_1,
+                             compression: cmp_1,
++                            flags: bf,
++                            encrypted: !!(bf & 1),
++                            usesDataDescriptor: !!dd,
++                            crc: dd ? undefined : crc_1,
+                             start: function () {
+                                 if (!file_1.ondata)
+                                     err(5);
+@@ -2503,12 +2509,15 @@ var Unzip = /*#__PURE__*/ (function () {
+                         };
+                         if (sc_1 >= 0)
+                             file_1.size = sc_1, file_1.originalSize = su_1;
++                        this_1.f = file_1;
+                         this_1.onfile(file_1);
+                     }
+                     return "break";
+                 }
+                 else if (oc) {
+                     if (sig == 0x8074B50) {
++                        if (this_1.f)
++                            this_1.f.crc = b4(buf, i + 4);
+                         is = i += 12 + (oc == -2 && 8), f = 3, this_1.c = 0;
+                         return "break";
+                     }
