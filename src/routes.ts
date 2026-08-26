@@ -6,6 +6,7 @@ import {
   selectSingleEntry,
   selectorOccurrencePaths,
 } from "./archive/select";
+import { LIMITS } from "./constants";
 import { GatewayError, asGatewayError, errorResponse } from "./errors";
 import { rawResponse } from "./outputs/raw-response";
 import { uploadByteStream } from "./outputs/transfer";
@@ -19,6 +20,14 @@ import {
 import { fetchSource } from "./source/fetch";
 import type { FetchedSource } from "./source/fetch";
 import { probeSource } from "./source/probe";
+import type { ByteStream } from "./streams/byte-stream";
+import {
+  applyEntryTransforms,
+  applyFinalTransforms,
+  limitBytes,
+  validateEntryTransforms,
+  validateFinalTransforms,
+} from "./transforms";
 import { readJsonRequest } from "./util/json";
 import { logRequest, requestId, safeUrlParts } from "./util/logging";
 
@@ -38,20 +47,15 @@ function detectionHints(source: FetchedSource) {
   };
 }
 
-function requireNoTransforms(input: {
-  entryTransforms: readonly unknown[];
-  finalTransforms?: readonly unknown[];
-}): void {
-  if (
-    input.entryTransforms.length !== 0 ||
-    (input.finalTransforms?.length ?? 0) !== 0
-  ) {
-    throw new GatewayError(
-      "INVALID_REQUEST",
-      "This pipeline requires archive or transform processing.",
-      { stage: "pipeline-validate" },
-    );
-  }
+async function transformEntry(
+  byteStream: ByteStream,
+  transforms: Parameters<typeof applyEntryTransforms>[1],
+  allowMultipartFormData: boolean,
+): Promise<ByteStream> {
+  const transformed = await applyEntryTransforms(byteStream, transforms, {
+    allowMultipartFormData,
+  });
+  return limitBytes(transformed, LIMITS.entryOutputBytes);
 }
 
 async function handleProbe(request: Request): Promise<Response> {
@@ -93,51 +97,66 @@ async function handleList(request: Request): Promise<Response> {
 async function handleStream(request: Request): Promise<Response> {
   const value = await readJsonRequest(request);
   const input = parseSchema(streamRequestSchema, value);
-  requireNoTransforms(input);
-  const source = await fetchSource(input.source, request.signal);
+  validateEntryTransforms(input.entryTransforms, { allowMultipartFormData: false });
+  validateFinalTransforms(input.finalTransforms);
   if (input.archive === undefined) {
     if (input.output.mode !== "raw") {
-      source.byteStream.abort("raw sources cannot produce multipart output");
       throw new GatewayError("INVALID_REQUEST", "A raw source requires raw output mode.", {
         stage: "pipeline-validate",
       });
     }
-    return rawResponse(source.byteStream, input.output);
+  } else {
+    assertUniqueSelectors(input.archive.entries);
+    if (input.output.mode !== "raw" || input.archive.entries.length !== 1) {
+      throw new GatewayError("INVALID_REQUEST", "Raw output requires exactly one archive entry.", {
+        stage: "pipeline-validate",
+      });
+    }
   }
 
-  assertUniqueSelectors(input.archive.entries);
-  if (input.output.mode !== "raw" || input.archive.entries.length !== 1) {
-    source.byteStream.abort("multi-entry output is not raw");
-    throw new GatewayError("INVALID_REQUEST", "Raw output requires exactly one archive entry.", {
-      stage: "pipeline-validate",
-    });
+  const source = await fetchSource(input.source, request.signal);
+  if (input.archive === undefined) {
+    const entryOutput = await transformEntry(source.byteStream, input.entryTransforms, false);
+    const finalOutput = limitBytes(
+      await applyFinalTransforms(entryOutput, input.finalTransforms),
+      LIMITS.requestOutputBytes,
+    );
+    return rawResponse(finalOutput, input.output);
   }
+
   const archive = await openArchive(
     source.byteStream,
     detectionHints(source),
     { occurrencePaths: selectorOccurrencePaths(input.archive.entries) },
   );
   const selected = await selectSingleEntry(archive, input.archive.entries[0]!);
-  return rawResponse(selected.byteStream, input.output);
+  const entryOutput = await transformEntry(selected.byteStream, input.entryTransforms, false);
+  const finalOutput = limitBytes(
+    await applyFinalTransforms(entryOutput, input.finalTransforms),
+    LIMITS.requestOutputBytes,
+  );
+  return rawResponse(finalOutput, input.output);
 }
 
 async function handleTransfer(request: Request): Promise<Response> {
   const value = await readJsonRequest(request);
   const input = parseSchema(transferRequestSchema, value);
-  requireNoTransforms(input);
+  validateEntryTransforms(input.entryTransforms, { allowMultipartFormData: true });
+  if (input.archive !== undefined) {
+    assertUniqueSelectors(input.archive.entries);
+    if (input.archive.entries.length !== 1) {
+      throw new GatewayError(
+        "INVALID_REQUEST",
+        "A transfer requires exactly one archive entry.",
+        { stage: "pipeline-validate" },
+      );
+    }
+  }
   const source = await fetchSource(input.source, request.signal);
 
   try {
     let byteStream = source.byteStream;
     if (input.archive !== undefined) {
-      assertUniqueSelectors(input.archive.entries);
-      if (input.archive.entries.length !== 1) {
-        throw new GatewayError(
-          "INVALID_REQUEST",
-          "A transfer requires exactly one archive entry.",
-          { stage: "pipeline-validate" },
-        );
-      }
       const archive = await openArchive(
         source.byteStream,
         detectionHints(source),
@@ -147,6 +166,7 @@ async function handleTransfer(request: Request): Promise<Response> {
         await selectSingleEntry(archive, input.archive.entries[0]!)
       ).byteStream;
     }
+    byteStream = await transformEntry(byteStream, input.entryTransforms, true);
     const result = await uploadByteStream(byteStream, input.target, request.signal);
     return Response.json(
       {
