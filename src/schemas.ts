@@ -4,6 +4,13 @@ import { GatewayError } from "./errors";
 
 const headersSchema = z.record(z.string().min(1).max(256), z.string().max(65_536));
 const statusSchema = z.number().int().min(100).max(599);
+const pathSchema = z
+  .string()
+  .min(1)
+  .max(LIMITS.pathBytes)
+  .refine((path) => new TextEncoder().encode(path).byteLength <= LIMITS.pathBytes, {
+    message: `Archive paths must be at most ${LIMITS.pathBytes} UTF-8 bytes.`,
+  });
 
 export const sourceSchema = z
   .object({
@@ -29,7 +36,7 @@ export const sourceSchema = z
 export const entrySelectorSchema = z
   .object({
     id: z.string().min(1).max(256).optional(),
-    path: z.string().min(1).max(LIMITS.pathBytes),
+    path: pathSchema,
     occurrence: z.number().int().min(1).default(1),
     required: z.boolean().default(true),
   })
@@ -193,7 +200,7 @@ export const transferRequestSchema = z
 export const distributionRouteSchema = z
   .object({
     id: z.string().min(1).max(256).optional(),
-    path: z.string().min(1).max(LIMITS.pathBytes),
+    path: pathSchema,
     occurrence: z.number().int().min(1).default(1),
     required: z.boolean().default(true),
     transforms: z.array(entryTransformSchema).max(LIMITS.transforms).default([]),
@@ -210,6 +217,8 @@ export const distributeRequestSchema = z
   .strict();
 
 export type SourceSpec = z.infer<typeof sourceSchema>;
+export type ProbeRequest = z.infer<typeof probeRequestSchema>;
+export type ListRequest = z.infer<typeof listRequestSchema>;
 export type EntrySelector = z.infer<typeof entrySelectorSchema>;
 export type ArchiveSelectionSpec = z.infer<typeof archiveSelectionSchema>;
 export type EntryTransformSpec = z.infer<typeof entryTransformSchema>;

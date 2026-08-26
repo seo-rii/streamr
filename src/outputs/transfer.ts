@@ -26,9 +26,34 @@ export interface UploadResult {
   targetResponse: TargetResponseCapture;
 }
 
+interface PreparedHttpTarget {
+  url: URL;
+  headers: Headers;
+}
+
+function prepareHttpTarget(target: HttpTargetSpec): PreparedHttpTarget {
+  const url = parseHttpUrl(target.url, "target-validate");
+  const headers = validatedHeaders(target.headers, {
+    forbidden: FORBIDDEN_TARGET_HEADERS,
+    stage: "target-validate",
+  });
+  if (target.contentType !== undefined && /[\r\n]/.test(target.contentType)) {
+    throw new GatewayError("INVALID_CONTENT_TYPE", "The target content type is invalid.", {
+      stage: "target-validate",
+    });
+  }
+  return { url, headers };
+}
+
+/** Validate every target field that does not depend on the eventual body. */
+export function validateHttpTarget(target: HttpTargetSpec): void {
+  void prepareHttpTarget(target);
+}
+
 async function captureResponse(
   response: Response,
   limit: number,
+  signal: AbortSignal,
 ): Promise<TargetResponseCapture> {
   const contentType = response.headers.get("Content-Type");
   if (response.body === null) {
@@ -43,28 +68,45 @@ async function captureResponse(
   const chunks: Uint8Array[] = [];
   let total = 0;
   let truncated = false;
+  let rejectAbort: ((reason: unknown) => void) | undefined;
+  const aborted = new Promise<never>((_resolve, reject) => {
+    rejectAbort = reject;
+  });
+  const onAbort = () =>
+    rejectAbort?.(
+      signal.reason ?? new DOMException("The target request was aborted.", "AbortError"),
+    );
+  if (signal.aborted) onAbort();
+  else signal.addEventListener("abort", onAbort, { once: true });
 
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    const remaining = limit - total;
-    if (value.byteLength > remaining) {
-      if (remaining > 0) chunks.push(value.subarray(0, remaining));
-      total += Math.max(remaining, 0);
-      truncated = true;
-      await reader.cancel("target response capture limit reached");
-      break;
-    }
-    chunks.push(value);
-    total += value.byteLength;
-    if (total === limit) {
-      const next = await reader.read();
-      if (!next.done) {
+  try {
+    for (;;) {
+      const { done, value } = await Promise.race([reader.read(), aborted]);
+      if (done) break;
+      const remaining = limit - total;
+      if (value.byteLength > remaining) {
+        if (remaining > 0) chunks.push(value.subarray(0, remaining));
+        total += Math.max(remaining, 0);
         truncated = true;
         await reader.cancel("target response capture limit reached");
+        break;
       }
-      break;
+      chunks.push(value);
+      total += value.byteLength;
+      if (total === limit) {
+        const next = await Promise.race([reader.read(), aborted]);
+        if (!next.done) {
+          truncated = true;
+          await reader.cancel("target response capture limit reached");
+        }
+        break;
+      }
     }
+  } catch (error) {
+    await reader.cancel(error).catch(() => undefined);
+    throw error;
+  } finally {
+    signal.removeEventListener("abort", onAbort);
   }
 
   const captured = new Uint8Array(total);
@@ -85,18 +127,8 @@ export async function uploadByteStream(
   target: HttpTargetSpec,
   parentSignal?: AbortSignal,
 ): Promise<UploadResult> {
-  const url = parseHttpUrl(target.url, "target-validate");
-  const headers = validatedHeaders(target.headers, {
-    forbidden: FORBIDDEN_TARGET_HEADERS,
-    stage: "target-validate",
-  });
+  const { url, headers } = prepareHttpTarget(target);
   if (target.contentType !== undefined) {
-    if (/[\r\n]/.test(target.contentType)) {
-      byteStream.abort("invalid target content type");
-      throw new GatewayError("INVALID_CONTENT_TYPE", "The target content type is invalid.", {
-        stage: "target-validate",
-      });
-    }
     headers.set("Content-Type", target.contentType);
   } else if (byteStream.contentType !== undefined) {
     headers.set("Content-Type", byteStream.contentType);
@@ -111,13 +143,66 @@ export async function uploadByteStream(
 
   const timedAbort = createTimedAbort(target.timeoutMs, parentSignal);
   let bytesWritten = 0;
-  const counted = byteStream.stream.pipeThrough(
-    new TransformStream<Uint8Array, Uint8Array>({
-      transform(chunk, controller) {
-        bytesWritten += chunk.byteLength;
-        controller.enqueue(chunk);
+  const sourceReader = byteStream.stream.getReader();
+  let sourceReaderReleased = false;
+  let uploadSettled = false;
+  let resolveUpload: (() => void) | undefined;
+  let rejectUpload: ((reason: unknown) => void) | undefined;
+  const sourceCompletion = new Promise<void>((resolve, reject) => {
+    resolveUpload = resolve;
+    rejectUpload = reject;
+  });
+  const releaseSourceReader = () => {
+    if (sourceReaderReleased) return;
+    sourceReaderReleased = true;
+    sourceReader.releaseLock();
+  };
+  const finishUpload = () => {
+    if (uploadSettled) return;
+    uploadSettled = true;
+    releaseSourceReader();
+    resolveUpload?.();
+  };
+  const failUpload = (reason: unknown) => {
+    if (uploadSettled) return;
+    uploadSettled = true;
+    rejectUpload?.(reason);
+  };
+  const cancelUpload = async (reason: unknown): Promise<void> => {
+    failUpload(reason);
+    byteStream.abort(reason);
+    try {
+      await sourceReader.cancel(reason);
+    } catch {
+      // The source abort path is authoritative; cancellation is best effort.
+    } finally {
+      releaseSourceReader();
+    }
+  };
+
+  const counted = new ReadableStream<Uint8Array>(
+    {
+      async pull(controller) {
+        try {
+          const result = await sourceReader.read();
+          if (result.done) {
+            finishUpload();
+            controller.close();
+            return;
+          }
+          bytesWritten += result.value.byteLength;
+          controller.enqueue(result.value);
+        } catch (error) {
+          failUpload(error);
+          releaseSourceReader();
+          controller.error(error);
+        }
       },
-    }),
+      async cancel(reason) {
+        await cancelUpload(reason);
+      },
+    },
+    { highWaterMark: 0 },
   );
 
   let body: ReadableStream<Uint8Array> = counted;
@@ -129,6 +214,15 @@ export async function uploadByteStream(
     });
     body = fixed.readable;
   }
+  const uploadCompletion =
+    fixedLengthPump === undefined
+      ? sourceCompletion
+      : Promise.all([sourceCompletion, fixedLengthPump]).then(() => undefined);
+  void uploadCompletion.catch(() => undefined);
+  const abortUpload = () => {
+    void cancelUpload(timedAbort.controller.signal.reason).catch(() => undefined);
+  };
+  timedAbort.controller.signal.addEventListener("abort", abortUpload, { once: true });
 
   let response: Response;
   try {
@@ -140,9 +234,9 @@ export async function uploadByteStream(
       signal: timedAbort.controller.signal,
     });
   } catch (error) {
-    byteStream.abort(error);
+    void cancelUpload(error).catch(() => undefined);
+    timedAbort.controller.signal.removeEventListener("abort", abortUpload);
     timedAbort.clear();
-    await fixedLengthPump?.catch(() => undefined);
     if (timedAbort.timedOut()) {
       throw new GatewayError("TARGET_TIMEOUT", "The target request timed out.", {
         stage: "target-fetch",
@@ -157,30 +251,69 @@ export async function uploadByteStream(
     });
   }
 
-  try {
-    await fixedLengthPump;
-  } catch (error) {
-    timedAbort.clear();
-    byteStream.abort(error);
-    await response.body?.cancel("target body upload failed");
-    throw new GatewayError("TARGET_BODY_REJECTED", "The target rejected the request body.", {
-      stage: "target-upload",
-      retryable: true,
-      cause: error,
-    });
-  }
-  timedAbort.clear();
-
   if (response.status >= 300 && response.status <= 399) {
+    void cancelUpload("target redirect rejected").catch(() => undefined);
     await response.body?.cancel("target redirect rejected");
+    timedAbort.controller.signal.removeEventListener("abort", abortUpload);
+    timedAbort.clear();
     throw new GatewayError("TARGET_REDIRECT", "Target redirects are not followed.", {
       stage: "target-response",
       details: { status: response.status },
     });
   }
 
-  const targetResponse = await captureResponse(response, target.responseBodyLimit);
-  if (!target.successStatus.includes(response.status)) {
+  const statusAccepted = target.successStatus.includes(response.status);
+  if (!statusAccepted) {
+    void cancelUpload("target status rejected").catch(() => undefined);
+  } else {
+    try {
+      await uploadCompletion;
+    } catch (error) {
+      timedAbort.controller.signal.removeEventListener("abort", abortUpload);
+      timedAbort.clear();
+      await response.body?.cancel("target body upload failed");
+      if (timedAbort.timedOut()) {
+        throw new GatewayError("TARGET_TIMEOUT", "The target request timed out.", {
+          stage: "target-upload",
+          retryable: true,
+          cause: error,
+        });
+      }
+      throw new GatewayError("TARGET_BODY_REJECTED", "The target rejected the request body.", {
+        stage: "target-upload",
+        retryable: true,
+        cause: error,
+      });
+    }
+  }
+
+  let targetResponse: TargetResponseCapture;
+  try {
+    targetResponse = await captureResponse(
+      response,
+      target.responseBodyLimit,
+      timedAbort.controller.signal,
+    );
+  } catch (error) {
+    timedAbort.controller.signal.removeEventListener("abort", abortUpload);
+    timedAbort.clear();
+    if (timedAbort.timedOut()) {
+      throw new GatewayError("TARGET_TIMEOUT", "The target request timed out.", {
+        stage: "target-response",
+        retryable: true,
+        cause: error,
+      });
+    }
+    throw new GatewayError("TARGET_FETCH_FAILED", "The target response could not be read.", {
+      stage: "target-response",
+      retryable: true,
+      cause: error,
+    });
+  }
+  timedAbort.controller.signal.removeEventListener("abort", abortUpload);
+  timedAbort.clear();
+
+  if (!statusAccepted) {
     throw new GatewayError("TARGET_STATUS_REJECTED", "The target status was rejected.", {
       stage: "target-response",
       retryable: response.status >= 500,
@@ -198,4 +331,3 @@ export async function uploadByteStream(
     targetResponse,
   };
 }
-
