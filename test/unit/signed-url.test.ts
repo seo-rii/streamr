@@ -175,6 +175,25 @@ describe("signed stream URLs", () => {
     ).rejects.toMatchObject({ code: "SIGNATURE_INVALID" });
   });
 
+  it("keeps signed GET pipelines public by rejecting every custom header", async () => {
+    await expect(
+      createSignedStreamUrl(
+        "https://gateway.test",
+        {
+          source: {
+            url: "https://source.test/archive.zip",
+            headers: { "X-API-Key": "secret" },
+          },
+        },
+        SECRET,
+        NOW,
+      ),
+    ).rejects.toMatchObject({
+      code: "INVALID_REQUEST",
+      details: { header: "X-API-Key" },
+    });
+  });
+
   it("rejects non-HTTP URLs and URL credentials", async () => {
     await expect(
       createSignedStreamUrl(

@@ -1,4 +1,4 @@
-import { LIMITS, SENSITIVE_REDIRECT_HEADERS } from "../constants";
+import { LIMITS } from "../constants";
 import { GatewayError } from "../errors";
 
 const textEncoder = new TextEncoder();
@@ -129,14 +129,13 @@ function validateSignedPipeline(value: unknown, stage: SignedUrlStage): void {
       const lowerName = name.toLowerCase();
       if (lowerName === "url") validateHttpUrl(child, stage);
       if (lowerName === "headers" && child !== null && typeof child === "object") {
-        for (const headerName of Object.keys(child)) {
-          if (SENSITIVE_REDIRECT_HEADERS.has(headerName.toLowerCase())) {
-            throw new GatewayError(
-              stage === "signed-url-create" ? "INVALID_REQUEST" : "SIGNATURE_INVALID",
-              "Sensitive headers are not allowed in a signed URL payload.",
-              { stage, details: { header: headerName } },
-            );
-          }
+        const headerName = Object.keys(child)[0];
+        if (headerName !== undefined) {
+          throw new GatewayError(
+            stage === "signed-url-create" ? "INVALID_REQUEST" : "SIGNATURE_INVALID",
+            "Custom headers are not allowed in a public signed URL payload; use POST /v1/stream.",
+            { stage, details: { header: headerName } },
+          );
         }
       }
       pending.push(child);
