@@ -184,7 +184,7 @@ Inspect the JSON `ok`, every route `status`, `warnings`, and `errors`; HTTP 200 
 
 ## MCP endpoint
 
-`POST /mcp` is a stateless Streamable HTTP endpoint. A fresh MCP server is created for each HTTP request, and MCP cancellation propagates to the active source or target. Configure the MCP client with the gateway URL and the same Bearer token used by the HTTP API.
+`POST /mcp` is a stateless Streamable HTTP endpoint. A fresh MCP server is created for each HTTP request, and MCP cancellation propagates to the active source or target. Configure the MCP client with the gateway URL and the same Bearer token used by the HTTP API. The control body is bounded at 8 MiB, and JSON-RPC batches are rejected for both modern and legacy-compatible clients so one inbound request can start at most one operation.
 
 The server exposes exactly five tools:
 
@@ -258,7 +258,7 @@ A signed URL is a short-lived bearer capability. Anyone who obtains it can execu
 - Signed pipelines may contain only HTTP/HTTPS URLs without URL credentials or IP literals.
 - **All custom `headers` are forbidden in a signed payload**, including nonstandard API-key headers. Use authenticated `POST /v1/stream` whenever a source requires headers.
 - Signed stream pipelines cannot perform target uploads; they use the stream request schema only.
-- Query strings can appear in browser history, proxy logs, referrers, screenshots, and copied links. Do not put private source URLs or other secrets in the payload, do not share the URL, and avoid third-party redirects from the gateway response.
+- Query strings can appear in browser history, proxy logs, screenshots, and copied links. Successful stream responses set `Referrer-Policy: no-referrer`, `X-Content-Type-Options: nosniff`, and `Cache-Control: no-store`, but callers must still avoid private source URLs or other secrets in the payload and must not share the capability URL.
 - Rotating `URL_SIGNING_SECRET` invalidates all outstanding URLs. Use a separate high-entropy value from `MCP_API_TOKEN`.
 
 The signature authenticates the pipeline, not the bytes returned by the source. Use TLS and an application-level digest when source integrity matters.
@@ -278,6 +278,8 @@ The signature authenticates the pipeline, not the bytes returned by the source. 
 | 7z / RAR | Rejected with `UNSUPPORTED_FORMAT` |
 | Encrypted ZIP | Rejected with `ARCHIVE_ENCRYPTED` |
 
+When a ZIP operation reaches EOF, the gateway validates every central-directory record against the EOCD/ZIP64 offset, size, count, and trailer layout without retaining the directory payload. This catches truncated or contradictory directories, including directories larger than the retained 132 KiB validation tail. An intentional early single- or multi-entry stop does not claim that EOF validation ran.
+
 Bare GZIP, BZIP2, XZ, and ZSTD streams are exposed to archive operations as a single entry:
 
 ```json
@@ -296,9 +298,11 @@ Automatic nesting is limited to one compression layer followed by TAR. A ZIP ent
 
 Paths are normalized (`\` to `/`, leading `./` removed, repeated separators collapsed) and matched by exact full path. There is no basename search, glob, regex, case folding, random access, or request-order sorting. Duplicate paths use one-based `occurrence`; the default is 1. Directories, symlinks, and hardlinks can be listed but not extracted as file bodies. Unsafe absolute, drive, UNC, and parent-relative paths are marked in list metadata; the gateway never writes them to a filesystem.
 
+A raw single-entry response sets `X-Stream-Gateway-Integrity-Scope: selected-entry`. It validates the selected entry as it is decoded, then may cancel the unread archive tail; it therefore does not claim whole-archive integrity. Operations that reach archive EOF perform the format's terminal validation.
+
 ## Multipart completion contract
 
-Multiple selected files are returned as `multipart/mixed` with a cryptographically random `sgw_...` boundary. Every file part includes `Content-Type`, RFC 5987 `Content-Disposition`, `X-Archive-Path`, and `X-Archive-Index`.
+Multiple selected files are returned as `multipart/mixed` with a cryptographically random `sgw_...` boundary. Every file part includes `Content-Type`, RFC 5987 `Content-Disposition`, `X-Archive-Path`, `X-Archive-Index`, and selector path/occurrence/required headers; `X-Stream-Gateway-Selector-Id` is included when the selector supplied an id.
 
 The **last part must be the manifest**:
 
@@ -314,11 +318,25 @@ X-Stream-Gateway-Control: manifest
   "requested": 4,
   "emitted": 3,
   "missing": ["data/02.ans"],
-  "errors": []
+  "errors": [],
+  "selectors": [
+    {
+      "id": "answer-02",
+      "path": "data/02.ans",
+      "occurrence": 1,
+      "required": true,
+      "status": "missing"
+    }
+  ],
+  "archive": {
+    "fullyScanned": true,
+    "stoppedEarly": false,
+    "integrityScope": "full-archive"
+  }
 }
 ```
 
-Consumers must parse through the final boundary, locate the part with `X-Stream-Gateway-Control: manifest`, and inspect `ok`, `missing`, and `errors` before accepting the result. `ok: true` means every required selector completed; an optional selector can still appear in `missing`. HTTP 200 alone is not success: a later entry may be missing or the archive may fail after earlier file parts have already been sent. If the connection ends before a valid manifest and closing boundary, treat the multipart result as incomplete. When no selected entry is found, the response contains only a manifest; it fails when any missing selector was required.
+Consumers must parse through the final boundary, locate the part with `X-Stream-Gateway-Control: manifest`, and inspect `ok`, `selectors`, `archive`, `missing`, and `errors` before accepting the result. Selector results preserve request identity and distinguish `emitted`, `failed`, `missing`, and `unresolved`. `archive.integrityScope` distinguishes a validated full archive from an intentional selected-entry early stop and a partial archive failure. `ok: true` means every required selector completed; an optional selector can still appear in `missing`. HTTP 200 alone is not success: a later entry may be missing or the archive may fail after earlier file parts have already been sent. If the connection ends before a valid manifest and closing boundary, treat the multipart result as incomplete. When no selected entry is found, the response contains only a manifest; it fails when any missing selector was required.
 
 ## Distribution semantics
 
@@ -333,8 +351,9 @@ Distribution is **not atomic**:
 - The default accepted statuses are 200 through 208. Other statuses become `TARGET_STATUS_REJECTED` unless `successStatus` is overridden.
 - `POST`, `PUT`, and `PATCH` are supported. The caller cannot set `Content-Length`; `requireContentLength: true` fails with `CONTENT_LENGTH_UNKNOWN` when streaming transforms make the length unknown.
 - Textual target response bodies are captured up to 64 KiB per target by default. Binary bodies are cancelled rather than buffered. A distribution additionally has a bounded aggregate response-capture budget.
+- Successful uploads are reported only after both the complete request body and target response have settled. Failure details include `bytesWritten` and `requestBodyState`; these report gateway-side stream progress, not a transactional acknowledgment by the target application.
 
-With `failurePolicy: "abort"` (the default), the source is cancelled after the first failed route and unresolved routes are reported as `not-run`. With `"continue"`, the remainder of the failed entry is drained or discarded before archive scanning proceeds. Required failures or misses make the final `ok` false; optional misses and failures appear in `warnings`.
+With `failurePolicy: "abort"` (the default), the source is cancelled after the first failed route and unresolved routes are reported as `not-run`. With `"continue"`, the remainder of the failed entry is drained or discarded before archive scanning proceeds. Required failures or misses make the final `ok` false; optional misses and failures appear in `warnings`. The result's `archiveFullyScanned` and `integrityScope` fields state whether EOF validation ran, all successful selected entries were consumed before an early stop, or only a partial archive was examined.
 
 If all-or-nothing behavior is required, the target service must provide its own transaction, staging, idempotency-key, commit, rollback, or batch-upload API.
 
@@ -353,7 +372,7 @@ Entry transforms run in order and are applied independently to each selected fil
 | `gzip` | GZIP-encodes the current entry or final stream |
 | `multipart-form-data` | Wraps one target upload; must be the final route/transfer entry transform |
 
-Only `limit` and `gzip` are valid final transforms. Text transforms are never applied to an already encoded `multipart/mixed` envelope. Invalid UTF-8 is an error; arbitrary JavaScript, regex replacement, ZIP/TAR repackaging, and arbitrary code execution are not supported.
+Only `limit` and `gzip` are valid final transforms for a raw result. A `multipart/mixed` result permits only final `gzip`: a caller-supplied final byte limit is rejected before source fetch because it could prevent the mandatory manifest from being emitted. Text transforms are never applied to an already encoded multipart envelope. Invalid UTF-8 is an error; arbitrary JavaScript, regex replacement, ZIP/TAR repackaging, and arbitrary code execution are not supported.
 
 ## Default limits and bounded-memory ceilings
 
@@ -374,14 +393,14 @@ Only `limit` and `gzip` are valid final transforms. Text transforms are never ap
 | Signed payload / lifetime | 8 KiB / 10 minutes |
 | Supplied headers | 128 headers; 16 KiB per value |
 | List, multipart selector, or distribution metadata | 16 MiB per operation |
-| ZIP input batch / callback burst / validation tail | 4 KiB / 16 MiB / 128 KiB |
+| ZIP input batch / callback burst / validation tail | 4 KiB / 8 MiB / 132 KiB |
 | BZIP2 input batch / decoder block | 4 KiB / at most 900 KiB |
-| ZSTD input batch / callback queue / window | 4 KiB / 16 MiB / 32 MiB |
-| XZ decoder memory | 64 MiB |
+| ZSTD input batch / callback queue / window | 4 KiB / 8 MiB / 16 MiB |
+| XZ decoder memory | 32 MiB |
 
-These are gateway ceilings, not guarantees that every Cloudflare plan or upstream permits a transfer of that size or duration. The Worker config requests 300,000 ms CPU time and 20,000 subrequests; account-level limits still apply.
+These are gateway ceilings, not guarantees that every Cloudflare plan or upstream permits a transfer of that size or duration. The Worker config requests 300,000 ms CPU time and 20,000 subrequests and therefore requires a paid Workers Standard usage model; account-level limits and the platform's 128 MiB isolate ceiling still apply.
 
-The bundled streaming ZSTD decoder validates an optional frame content checksum and rejects windows above 32 MiB. A transport- or application-level trusted digest is still recommended when end-to-end source integrity matters.
+The bundled streaming ZSTD decoder validates an optional frame content checksum and rejects windows above 16 MiB. A transport- or application-level trusted digest is still recommended when end-to-end source integrity matters.
 
 ## Errors and observability
 

@@ -1,9 +1,9 @@
 node_modules/
 .dev.vars
+.streamr-production.env
 .env
 .wrangler/
 coverage/
 dist/
 .codex/gpt-pro/
 *.log
-
