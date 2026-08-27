@@ -152,7 +152,7 @@ describe("ZSTD decompression", () => {
     ).rejects.toMatchObject({ code: "CORRUPT_ARCHIVE", stage: "decompress" });
   });
 
-  it("rejects frames whose advertised decoder window exceeds 32 MiB", async () => {
+  it("rejects frames whose advertised decoder window exceeds 16 MiB", async () => {
     const oversizedWindowHeader = new Uint8Array([
       0x28, 0xb5, 0x2f, 0xfd,
       0x00,
@@ -167,7 +167,7 @@ describe("ZSTD decompression", () => {
     ).rejects.toMatchObject({
       code: "UNSUPPORTED_COMPRESSION",
       stage: "decompress",
-      details: { format: "zstd", maxWindowBytes: 32 * 1024 * 1024 },
+      details: { format: "zstd", maxWindowBytes: 16 * 1024 * 1024 },
     });
   });
 

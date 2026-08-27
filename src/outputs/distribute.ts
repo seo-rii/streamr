@@ -12,7 +12,7 @@ import {
   type TargetResponseCapture,
 } from "./transfer";
 
-const DISTRIBUTION_METADATA_BUDGET = 16 * 1024 * 1024;
+const DISTRIBUTION_METADATA_BUDGET = LIMITS.operationMetadataBytes;
 const TARGET_RESPONSE_CAPTURE_BUDGET = 2 * 1024 * 1024;
 
 export type FailurePolicy = "abort" | "continue";
@@ -64,6 +64,8 @@ export interface DistributionResult {
   archiveFormat: string;
   entriesScanned: number;
   stoppedEarly: boolean;
+  archiveFullyScanned: boolean;
+  integrityScope: "full-archive" | "selected-entries" | "partial-archive";
   results: DistributionEntryResult[];
   warnings: DistributionWarning[];
   errors: SerializedGatewayError[];
@@ -304,6 +306,17 @@ export async function distributeArchive(
               ),
             },
             signal,
+            {
+              cancellation:
+                failurePolicy === "abort"
+                  ? {
+                      mode: "abort",
+                      abort(reason?: unknown) {
+                        archive.abort(reason);
+                      },
+                    }
+                  : { mode: "drain" },
+            },
           );
           const capturedBytes = retainedResponseBytes(upload.targetResponse);
           responseCaptureRemaining = Math.max(0, responseCaptureRemaining - capturedBytes);
@@ -391,6 +404,11 @@ export async function distributeArchive(
       if (!prepared.route.required) warnings.push(warningFor(prepared, serialized));
     }
 
+    const archiveFullyScanned = !stoppedEarly;
+    const allSelectedEntriesCompleted =
+      completedKeys.size === preparedRoutes.length &&
+      errors.length === 0 &&
+      results.every((result) => result.status === "uploaded");
     return {
       ok:
         errors.length === 0 &&
@@ -398,6 +416,12 @@ export async function distributeArchive(
       archiveFormat: archive.format,
       entriesScanned,
       stoppedEarly,
+      archiveFullyScanned,
+      integrityScope: archiveFullyScanned
+        ? "full-archive"
+        : allSelectedEntriesCompleted
+          ? "selected-entries"
+          : "partial-archive",
       results,
       warnings,
       errors,

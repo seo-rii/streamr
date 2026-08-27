@@ -238,6 +238,8 @@ describe("archive distribution", () => {
       archiveFormat: "zip",
       entriesScanned: 3,
       stoppedEarly: true,
+      archiveFullyScanned: false,
+      integrityScope: "selected-entries",
       sourceGets: 1,
     });
     expect(fixture.yielded()).toBe(3);
@@ -280,7 +282,13 @@ describe("archive distribution", () => {
         details: { status: 500 },
       },
     });
-    expect(result).toMatchObject({ ok: false, entriesScanned: 2, stoppedEarly: true });
+    expect(result).toMatchObject({
+      ok: false,
+      entriesScanned: 2,
+      stoppedEarly: true,
+      archiveFullyScanned: false,
+      integrityScope: "partial-archive",
+    });
     expect(fixture.abort).toHaveBeenCalled();
   });
 
@@ -349,7 +357,12 @@ describe("archive distribution", () => {
       path: "optional.txt",
       error: { code: "ENTRY_NOT_FOUND" },
     });
-    expect(result).toMatchObject({ ok: false, stoppedEarly: false });
+    expect(result).toMatchObject({
+      ok: false,
+      stoppedEarly: false,
+      archiveFullyScanned: true,
+      integrityScope: "full-archive",
+    });
     expect(fixture.abort).not.toHaveBeenCalled();
   });
 

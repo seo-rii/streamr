@@ -116,7 +116,11 @@ export function errorResponse(error: unknown, requestId?: string): Response {
     },
     {
       status: gatewayError.status,
-      headers: { "Cache-Control": "no-store" },
+      headers: {
+        "Cache-Control": "no-store",
+        "Referrer-Policy": "no-referrer",
+        "X-Content-Type-Options": "nosniff",
+      },
     },
   );
 }

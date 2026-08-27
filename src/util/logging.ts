@@ -189,6 +189,7 @@ export function observeResponseCompletion(
   response: Response,
   log: RequestLogContext,
 ): Response {
+  if (response.status >= 400) log.markResult("error");
   if (response.body === null) {
     log.markResult("ok");
     log.finish();

@@ -13,7 +13,10 @@ import {
   distributeArchive,
   validateDistributionRoutes,
 } from "./outputs/distribute";
-import { createMultipartMixedStream } from "./outputs/multipart-mixed";
+import {
+  createMultipartMixedStream,
+  validateMultipartFinalTransforms,
+} from "./outputs/multipart-mixed";
 import { rawResponse } from "./outputs/raw-response";
 import { uploadByteStream, validateHttpTarget } from "./outputs/transfer";
 import {
@@ -112,6 +115,9 @@ function validateStreamPipeline(input: StreamRequest): void {
     throw new GatewayError("INVALID_REQUEST", "Raw output requires exactly one archive entry.", {
       stage: "pipeline-validate",
     });
+  }
+  if (input.output.mode === "multipart-mixed") {
+    validateMultipartFinalTransforms(input.finalTransforms);
   }
   if (
     input.output.mode === "multipart-mixed" &&
@@ -248,7 +254,12 @@ async function executeStream(
         LIMITS.requestOutputBytes,
       ),
     );
-    return rawResponse(log === undefined ? finalOutput : observeByteStream(finalOutput, log), input.output);
+    const response = rawResponse(
+      log === undefined ? finalOutput : observeByteStream(finalOutput, log),
+      input.output,
+    );
+    response.headers.set("X-Stream-Gateway-Integrity-Scope", "selected-entry");
+    return response;
   } catch (error) {
     source.byteStream.abort(error);
     throw error;

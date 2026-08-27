@@ -19,6 +19,10 @@ export const LIMITS = {
   prefixBytes: 512,
   headerCount: 128,
   headerValueBytes: 16 * 1024,
+  decoderBurstBytes: 8 * 1024 * 1024,
+  xzDecoderMemoryBytes: 32 * 1024 * 1024,
+  zstdWindowBytes: 16 * 1024 * 1024,
+  operationMetadataBytes: 16 * 1024 * 1024,
 } as const;
 
 export const DEFAULT_TARGET_SUCCESS_STATUS = [
@@ -30,4 +34,3 @@ export const SENSITIVE_REDIRECT_HEADERS = new Set([
   "cookie",
   "proxy-authorization",
 ]);
-

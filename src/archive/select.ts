@@ -6,7 +6,7 @@ import { wrapCancellableStream } from "../streams/byte-stream";
 import { normalizeArchivePath } from "../util/path";
 import type { ArchiveEntryHandle, OpenedArchive } from "./types";
 
-const LIST_METADATA_BUDGET = 16 * 1024 * 1024;
+const LIST_METADATA_BUDGET = LIMITS.operationMetadataBytes;
 
 export interface ListedEntry {
   index: number;

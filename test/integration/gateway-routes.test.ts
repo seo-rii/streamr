@@ -1,6 +1,7 @@
 import { env, exports } from "cloudflare:workers";
 import { strToU8, zipSync } from "fflate";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { MultipartMixedManifest } from "../../src/outputs/multipart-mixed";
 import { createSignedStreamUrl } from "../../src/util/signed-url";
 
 function authenticatedJson(path: string, body: unknown): Request {
@@ -64,6 +65,8 @@ describe("gateway HTTP route integration", () => {
     );
 
     expect(response.status).toBe(401);
+    expect(response.headers.get("Referrer-Policy")).toBe("no-referrer");
+    expect(response.headers.get("X-Content-Type-Options")).toBe("nosniff");
     expect(fetchMock).not.toHaveBeenCalled();
     await expect(response.json()).resolves.toMatchObject({
       ok: false,
@@ -122,6 +125,8 @@ describe("gateway HTTP route integration", () => {
     expect(response.headers.get("Content-Type")).toBe("text/plain; charset=utf-8");
     expect(response.headers.get("Content-Length")).toBe("8");
     expect(response.headers.get("Content-Disposition")).toContain("result.txt");
+    expect(response.headers.get("Referrer-Policy")).toBe("no-referrer");
+    expect(response.headers.get("X-Content-Type-Options")).toBe("nosniff");
     await expect(response.text()).resolves.toBe("raw-body");
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
@@ -202,7 +207,10 @@ describe("gateway HTTP route integration", () => {
       authenticatedJson("/v1/stream", {
         source: { url: "https://source.test/archive.zip" },
         archive: {
-          entries: [{ path: "data/b.txt" }, { path: "data/a.txt" }],
+          entries: [
+            { id: "selector-b", path: "data/b.txt" },
+            { id: "selector-a", path: "data/a.txt", required: false },
+          ],
         },
         output: { mode: "multipart-mixed" },
       }),
@@ -218,21 +226,73 @@ describe("gateway HTTP route integration", () => {
     expect(body.indexOf("X-Archive-Path: data%2Fa.txt")).toBeLessThan(
       body.indexOf("X-Archive-Path: data%2Fb.txt"),
     );
+    expect(body).toContain("X-Stream-Gateway-Selector-Id: selector-a");
+    expect(body).toContain("X-Stream-Gateway-Selector-Path: data%2Fa.txt");
+    expect(body).toContain("X-Stream-Gateway-Selector-Occurrence: 1");
+    expect(body).toContain("X-Stream-Gateway-Selector-Required: false");
     expect(body).toContain("\r\n\r\nbody-a\r\n");
     expect(body).toContain("\r\n\r\nbody-b\r\n");
     expect(body).not.toContain("not-selected");
     expect(body).toContain("X-Stream-Gateway-Control: manifest");
-    expect(body).toContain(
-      JSON.stringify({
-        ok: true,
-        requested: 2,
-        emitted: 2,
-        missing: [],
-        errors: [],
-      }),
-    );
+    const manifestMarker = "X-Stream-Gateway-Control: manifest\r\n\r\n";
+    const manifestStart = body.lastIndexOf(manifestMarker) + manifestMarker.length;
+    const manifestEnd = body.indexOf(`\r\n--${boundary}--\r\n`, manifestStart);
+    const manifest = JSON.parse(
+      body.slice(manifestStart, manifestEnd),
+    ) as MultipartMixedManifest;
+    expect(manifest).toMatchObject({
+      ok: true,
+      requested: 2,
+      emitted: 2,
+      missing: [],
+      errors: [],
+      selectors: [
+        {
+          id: "selector-b",
+          path: "data/b.txt",
+          occurrence: 1,
+          required: true,
+          status: "emitted",
+          archiveIndex: 2,
+        },
+        {
+          id: "selector-a",
+          path: "data/a.txt",
+          occurrence: 1,
+          required: false,
+          status: "emitted",
+          archiveIndex: 1,
+        },
+      ],
+      archive: {
+        fullyScanned: false,
+        stoppedEarly: true,
+        integrityScope: "selected-entries",
+      },
+    });
     expect(body.endsWith(`--${boundary}--\r\n`)).toBe(true);
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects a multipart final limit before fetching the source", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await exports.default.fetch(
+      authenticatedJson("/v1/stream", {
+        source: { url: "https://source.test/archive.zip" },
+        archive: { entries: [{ path: "data/a.txt" }] },
+        finalTransforms: [{ type: "limit", maxBytes: 1 }],
+        output: { mode: "multipart-mixed" },
+      }),
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({
+      ok: false,
+      error: { code: "INVALID_TRANSFORM", stage: "transform-validate" },
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("validates distribution transforms before fetching the source", async () => {

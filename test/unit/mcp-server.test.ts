@@ -8,6 +8,7 @@ import {
   createGatewayMcpHandler,
   createServer,
 } from "../../src/mcp/server";
+import { LIMITS } from "../../src/constants";
 import type { GatewayOperations } from "../../src/mcp/tools";
 import { describe, expect, it, vi } from "vitest";
 
@@ -133,6 +134,85 @@ describe("stateless MCP server", () => {
     } finally {
       await client.close();
     }
+  });
+
+  it("rejects JSON-RPC batches before any gateway operation starts", async () => {
+    const operations = gatewayOperations();
+    const handler = createGatewayMcpHandler(operations);
+    const response = await handler.fetch(
+      new Request("http://localhost/mcp", {
+        method: "POST",
+        headers: {
+          Accept: "application/json, text/event-stream",
+          "Content-Type": "application/json",
+          "MCP-Protocol-Version": "2026-07-28",
+        },
+        body: JSON.stringify([
+          {
+            jsonrpc: "2.0",
+            id: 1,
+            method: "tools/call",
+            params: {
+              name: "transfer",
+              arguments: {
+                source: { url: "https://source.test/one" },
+                target: { url: "https://target.test/one", method: "PUT" },
+              },
+            },
+          },
+          {
+            jsonrpc: "2.0",
+            id: 2,
+            method: "tools/call",
+            params: {
+              name: "transfer",
+              arguments: {
+                source: { url: "https://source.test/two" },
+                target: { url: "https://target.test/two", method: "PUT" },
+              },
+            },
+          },
+        ]),
+      }),
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({
+      jsonrpc: "2.0",
+      error: { code: -32600 },
+      id: null,
+    });
+    expect(operations.transfer).not.toHaveBeenCalled();
+  });
+
+  it("bounds and validates the MCP control request body", async () => {
+    const operations = gatewayOperations();
+    const handler = createGatewayMcpHandler(operations);
+
+    const malformed = await handler.fetch(
+      new Request("http://localhost/mcp", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{",
+      }),
+    );
+    expect(malformed.status).toBe(400);
+    await expect(malformed.json()).resolves.toMatchObject({
+      error: { code: -32700 },
+    });
+
+    const oversized = await handler.fetch(
+      new Request("http://localhost/mcp", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: new Uint8Array(LIMITS.controlRequestBytes + 1),
+      }),
+    );
+    expect(oversized.status).toBe(413);
+    await expect(oversized.json()).resolves.toMatchObject({
+      error: { code: -32600 },
+    });
+    expect(operations.probeUrl).not.toHaveBeenCalled();
   });
 
   it("propagates MCP call cancellation to the injected operation", async () => {

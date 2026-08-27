@@ -7,6 +7,14 @@ import type { ByteStream } from "../../src/streams/byte-stream";
 
 const encoder = new TextEncoder();
 
+function deferred(): { promise: Promise<void>; resolve(): void } {
+  let resolve: () => void = () => undefined;
+  const promise = new Promise<void>((promiseResolve) => {
+    resolve = promiseResolve;
+  });
+  return { promise, resolve };
+}
+
 function target(path: string, timeoutMs = 300_000): HttpTargetSpec {
   return {
     url: `https://target.test/${path}`,
@@ -233,6 +241,121 @@ describe("target streaming edges", () => {
     expect(source.abort).not.toHaveBeenCalled();
   });
 
+  it("reads an early duplex response while its body unlocks the request upload", async () => {
+    const source = chunkStream(["ab", "cd", "ef"]);
+    let targetBytes = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+        const requestBody = init?.body as ReadableStream<Uint8Array> | undefined;
+        if (requestBody === undefined) throw new Error("missing duplex request body");
+        return Promise.resolve(
+          new Response(
+            new ReadableStream<Uint8Array>({
+              async pull(controller) {
+                // The simulated target will not consume the request until the
+                // client begins reading this response body.
+                targetBytes = await consume(requestBody);
+                controller.enqueue(encoder.encode("ack"));
+                controller.close();
+              },
+            }),
+            { status: 201, headers: { "Content-Type": "text/plain" } },
+          ),
+        );
+      }),
+    );
+
+    const result = await uploadByteStream(source.byteStream, target("duplex", 500));
+
+    expect(targetBytes).toBe(6);
+    expect(result).toEqual({
+      targetStatus: 201,
+      bytesWritten: 6,
+      targetResponse: { contentType: "text/plain", body: "ack", truncated: false },
+    });
+    expect(source.abort).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { status: 302, code: "TARGET_REDIRECT" },
+    { status: 500, code: "TARGET_STATUS_REJECTED" },
+  ])("awaits request cancellation before returning $code", async ({ status, code }) => {
+    const cancelStarted = deferred();
+    const allowCancel = deferred();
+    const abort = vi.fn();
+    const source: ByteStream = {
+      stream: new ReadableStream<Uint8Array>(
+        {
+          cancel() {
+            cancelStarted.resolve();
+            return allowCancel.promise;
+          },
+        },
+        { highWaterMark: 0 },
+      ),
+      abort,
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => Promise.resolve(new Response(null, { status }))),
+    );
+
+    let settled = false;
+    const upload = uploadByteStream(source, target(`early-${status}`)).finally(() => {
+      settled = true;
+    });
+    await cancelStarted.promise;
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(abort).toHaveBeenCalled();
+
+    allowCancel.resolve();
+    await expect(upload).rejects.toMatchObject({
+      code,
+      details: { status, requestBodyState: "cancelled" },
+    });
+  });
+
+  it("cancels the request deterministically when an accepted response disconnects", async () => {
+    let sourceCancelled = false;
+    const abort = vi.fn();
+    const source: ByteStream = {
+      stream: new ReadableStream<Uint8Array>(
+        {
+          cancel() {
+            sourceCancelled = true;
+          },
+        },
+        { highWaterMark: 0 },
+      ),
+      abort,
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() =>
+        Promise.resolve(
+          new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.error(new Error("target disconnected"));
+              },
+            }),
+            { status: 201, headers: { "Content-Type": "text/plain" } },
+          ),
+        ),
+      ),
+    );
+
+    await expect(uploadByteStream(source, target("disconnect"))).rejects.toMatchObject({
+      code: "TARGET_FETCH_FAILED",
+      stage: "target-response",
+      details: { requestBodyState: "cancelled" },
+    });
+    expect(sourceCancelled).toBe(true);
+    expect(abort).toHaveBeenCalled();
+  });
+
   it("times out while a textual target response body is stalled", async () => {
     const source = chunkStream(["request"]);
     let responseCancelled = false;
@@ -263,6 +386,50 @@ describe("target streaming edges", () => {
     expect(responseCancelled).toBe(true);
   });
 
+  it("does not report a response timeout until response cancellation settles", async () => {
+    const source = chunkStream(["request"]);
+    const cancelStarted = deferred();
+    const allowCancel = deferred();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+        const body = init?.body as ReadableStream<Uint8Array> | undefined;
+        if (body === undefined) throw new Error("missing timeout request body");
+        await consume(body);
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            pull() {
+              return new Promise<void>(() => undefined);
+            },
+            cancel() {
+              cancelStarted.resolve();
+              return allowCancel.promise;
+            },
+          }),
+          { status: 201, headers: { "Content-Type": "text/plain" } },
+        );
+      }),
+    );
+
+    let settled = false;
+    const upload = uploadByteStream(source.byteStream, target("await-timeout-cleanup", 25)).finally(
+      () => {
+        settled = true;
+      },
+    );
+    await cancelStarted.promise;
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    allowCancel.resolve();
+    await expect(upload).rejects.toMatchObject({
+      code: "TARGET_TIMEOUT",
+      stage: "target-response",
+      details: { requestBodyState: "completed" },
+    });
+    expect(source.abort).not.toHaveBeenCalled();
+  });
+
   it("aborts instead of draining a large rejected entry under abort policy", async () => {
     const totalChunks = 50_000;
     const fixture = instrumentedArchive([{ path: "large.bin", chunks: totalChunks }]);
@@ -272,12 +439,14 @@ describe("target streaming edges", () => {
     );
 
     const result = await distributeArchive(fixture.archive, [route("large.bin")], "abort");
+    const chunksAtReturn = fixture.readChunks("large.bin");
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(result.results).toHaveLength(1);
     expect(result.results[0]).toMatchObject({ status: "failed" });
     expect(fixture.abort).toHaveBeenCalled();
-    expect(fixture.readChunks("large.bin")).toBeLessThan(totalChunks);
+    expect(chunksAtReturn).toBeLessThan(totalChunks);
+    expect(fixture.readChunks("large.bin")).toBe(chunksAtReturn);
   });
 
   it("drains a rejected entry before processing the next route under continue policy", async () => {

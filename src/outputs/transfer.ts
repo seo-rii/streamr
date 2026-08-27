@@ -26,6 +26,19 @@ export interface UploadResult {
   targetResponse: TargetResponseCapture;
 }
 
+export type UploadCancellationMode =
+  | { mode: "abort"; abort(reason?: unknown): void }
+  | { mode: "drain" };
+
+export interface UploadByteStreamOptions {
+  /**
+   * Archive distribution supplies an explicit policy so a rejected target can
+   * either abort the enclosing archive first or drain exactly the active entry.
+   * Direct transfers use the ByteStream's normal abort path.
+   */
+  cancellation?: UploadCancellationMode;
+}
+
 interface PreparedHttpTarget {
   url: URL;
   headers: Headers;
@@ -126,6 +139,7 @@ export async function uploadByteStream(
   byteStream: ByteStream,
   target: HttpTargetSpec,
   parentSignal?: AbortSignal,
+  options: UploadByteStreamOptions = {},
 ): Promise<UploadResult> {
   const { url, headers } = prepareHttpTarget(target);
   if (target.contentType !== undefined) {
@@ -142,11 +156,22 @@ export async function uploadByteStream(
   }
 
   const timedAbort = createTimedAbort(target.timeoutMs, parentSignal);
+  const requestAbort = new AbortController();
+  const responseAbort = new AbortController();
   let bytesWritten = 0;
   let sourceFailure: unknown;
   const sourceReader = byteStream.stream.getReader();
   let sourceReaderReleased = false;
-  let uploadSettled = false;
+  let requestBodyState:
+    | "streaming"
+    | "finishing"
+    | "completed"
+    | "failed"
+    | "cancelling"
+    | "cancelled" = "streaming";
+  let requestBodySettled = false;
+  let countedTerminated = false;
+  let countedController: ReadableStreamDefaultController<Uint8Array> | undefined;
   let resolveUpload: (() => void) | undefined;
   let rejectUpload: ((reason: unknown) => void) | undefined;
   const sourceCompletion = new Promise<void>((resolve, reject) => {
@@ -159,34 +184,73 @@ export async function uploadByteStream(
     sourceReader.releaseLock();
   };
   const finishUpload = () => {
-    if (uploadSettled) return;
-    uploadSettled = true;
+    if (requestBodySettled) return;
+    requestBodySettled = true;
+    requestBodyState = "finishing";
     releaseSourceReader();
     resolveUpload?.();
   };
   const failUpload = (reason: unknown) => {
-    if (uploadSettled) return;
-    uploadSettled = true;
+    if (requestBodySettled) return;
+    requestBodySettled = true;
     rejectUpload?.(reason);
   };
-  const cancelUpload = async (reason: unknown): Promise<void> => {
-    failUpload(reason);
-    byteStream.abort(reason);
-    try {
-      await sourceReader.cancel(reason);
-    } catch {
-      // The source abort path is authoritative; cancellation is best effort.
-    } finally {
-      releaseSourceReader();
+  // The promise is shared by every cancellation path. It is always awaited
+  // before this operation returns, so neither a decoder drain nor a source
+  // cancellation can outlive the target exchange.
+  let cancelUploadPromise: Promise<void> | undefined;
+  const cancelUpload = (reason: unknown): Promise<void> => {
+    if (requestBodyState === "completed" || requestBodyState === "failed") {
+      return cancelUploadPromise ?? Promise.resolve();
     }
+    if (cancelUploadPromise !== undefined) return cancelUploadPromise;
+
+    requestBodyState = "cancelling";
+    failUpload(reason);
+    requestAbort.abort(reason);
+    if (!countedTerminated) {
+      countedTerminated = true;
+      try {
+        countedController?.error(reason);
+      } catch {
+        // A simultaneous fetch-side cancellation may already own termination.
+      }
+    }
+
+    cancelUploadPromise = (async () => {
+      try {
+        if (options.cancellation?.mode === "abort") {
+          try {
+            options.cancellation.abort(reason);
+          } catch {
+            // Continue with the ByteStream cancellation, which is authoritative.
+          }
+        }
+        try {
+          byteStream.abort(reason);
+        } catch {
+          // The reader cancellation below still releases the stream lock.
+        }
+        await sourceReader.cancel(reason).catch(() => undefined);
+      } finally {
+        requestBodyState = "cancelled";
+        releaseSourceReader();
+      }
+    })();
+    return cancelUploadPromise;
   };
 
   const counted = new ReadableStream<Uint8Array>(
     {
+      start(controller) {
+        countedController = controller;
+      },
       async pull(controller) {
         try {
           const result = await sourceReader.read();
+          if (countedTerminated) return;
           if (result.done) {
+            countedTerminated = true;
             finishUpload();
             controller.close();
             return;
@@ -194,7 +258,10 @@ export async function uploadByteStream(
           bytesWritten += result.value.byteLength;
           controller.enqueue(result.value);
         } catch (error) {
+          if (countedTerminated) return;
+          countedTerminated = true;
           sourceFailure = error;
+          requestBodyState = "failed";
           failUpload(error);
           releaseSourceReader();
           controller.error(error);
@@ -212,126 +279,212 @@ export async function uploadByteStream(
   if (byteStream.knownLength !== undefined) {
     const fixed = new FixedLengthStream(byteStream.knownLength);
     fixedLengthPump = counted.pipeTo(fixed.writable, {
-      signal: timedAbort.controller.signal,
+      signal: requestAbort.signal,
     });
     body = fixed.readable;
   }
-  const uploadCompletion =
+  const uploadPumpCompletion =
     fixedLengthPump === undefined
       ? sourceCompletion
       : Promise.all([sourceCompletion, fixedLengthPump]).then(() => undefined);
+  const uploadCompletion = uploadPumpCompletion.then(
+    () => {
+      requestBodyState = "completed";
+    },
+    (error: unknown) => {
+      if (requestBodyState !== "cancelling" && requestBodyState !== "cancelled") {
+        requestBodyState = "failed";
+      }
+      throw error;
+    },
+  );
+  // These handlers observe early rejections until the exchange state machine
+  // reaches the corresponding awaited settlement below.
+  void sourceCompletion.catch(() => undefined);
+  void fixedLengthPump?.catch(() => undefined);
   void uploadCompletion.catch(() => undefined);
-  const abortUpload = () => {
-    void cancelUpload(timedAbort.controller.signal.reason).catch(() => undefined);
+  let responseCaptureCompleted = false;
+  let activeResponseCapture: Promise<TargetResponseCapture> | undefined;
+  let timeoutStage: "target-upload" | "target-response" = "target-upload";
+  const abortExchange = () => {
+    const reason = timedAbort.controller.signal.reason;
+    timeoutStage =
+      requestBodyState === "completed" && !responseCaptureCompleted
+        ? "target-response"
+        : "target-upload";
+    responseAbort.abort(reason);
+    cancelUpload(reason);
   };
-  timedAbort.controller.signal.addEventListener("abort", abortUpload, { once: true });
+  if (timedAbort.controller.signal.aborted) abortExchange();
+  else timedAbort.controller.signal.addEventListener("abort", abortExchange, { once: true });
 
-  let response: Response;
   try {
-    response = await fetch(url.toString(), {
-      method: target.method,
-      headers,
-      body,
-      redirect: "manual",
-      signal: timedAbort.controller.signal,
-    });
-  } catch (error) {
-    void cancelUpload(error).catch(() => undefined);
-    timedAbort.controller.signal.removeEventListener("abort", abortUpload);
-    timedAbort.clear();
-    if (timedAbort.timedOut()) {
-      throw new GatewayError("TARGET_TIMEOUT", "The target request timed out.", {
+    let response: Response;
+    try {
+      response = await fetch(url.toString(), {
+        method: target.method,
+        headers,
+        body,
+        redirect: "manual",
+        signal: timedAbort.controller.signal,
+      });
+    } catch (error) {
+      responseAbort.abort(error);
+      const cancellation = cancelUpload(error);
+      await Promise.allSettled([uploadCompletion, cancellation]);
+      if (timedAbort.timedOut()) {
+        throw new GatewayError("TARGET_TIMEOUT", "The target request timed out.", {
+          stage: "target-fetch",
+          retryable: true,
+          cause: error,
+          details: { bytesWritten, requestBodyState },
+        });
+      }
+      if (sourceFailure instanceof GatewayError) throw sourceFailure;
+      throw new GatewayError("TARGET_FETCH_FAILED", "The target request failed.", {
         stage: "target-fetch",
         retryable: true,
         cause: error,
+        details: { bytesWritten, requestBodyState },
       });
     }
-    if (sourceFailure instanceof GatewayError) throw sourceFailure;
-    throw new GatewayError("TARGET_FETCH_FAILED", "The target request failed.", {
-      stage: "target-fetch",
-      retryable: true,
-      cause: error,
-    });
-  }
 
-  if (response.status >= 300 && response.status <= 399) {
-    void cancelUpload("target redirect rejected").catch(() => undefined);
-    await response.body?.cancel("target redirect rejected");
-    timedAbort.controller.signal.removeEventListener("abort", abortUpload);
-    timedAbort.clear();
-    throw new GatewayError("TARGET_REDIRECT", "Target redirects are not followed.", {
-      stage: "target-response",
-      details: { status: response.status },
-    });
-  }
-
-  const statusAccepted = target.successStatus.includes(response.status);
-  if (!statusAccepted) {
-    void cancelUpload("target status rejected").catch(() => undefined);
-  } else {
-    try {
-      await uploadCompletion;
-    } catch (error) {
-      timedAbort.controller.signal.removeEventListener("abort", abortUpload);
-      timedAbort.clear();
-      await response.body?.cancel("target body upload failed");
-      if (timedAbort.timedOut()) {
-        throw new GatewayError("TARGET_TIMEOUT", "The target request timed out.", {
-          stage: "target-upload",
-          retryable: true,
-          cause: error,
-        });
-      }
-      if (error instanceof GatewayError) throw error;
-      throw new GatewayError("TARGET_BODY_REJECTED", "The target rejected the request body.", {
-        stage: "target-upload",
-        retryable: true,
-        cause: error,
+    if (response.status >= 300 && response.status <= 399) {
+      const reason = new GatewayError("TARGET_REDIRECT", "Target redirects are not followed.", {
+        stage: "target-response",
+        details: { status: response.status },
+      });
+      responseAbort.abort(reason);
+      const cancellation = cancelUpload(reason);
+      const responseCancellation = response.body?.cancel(reason) ?? Promise.resolve();
+      await Promise.allSettled([uploadCompletion, cancellation, responseCancellation]);
+      throw new GatewayError("TARGET_REDIRECT", "Target redirects are not followed.", {
+        stage: "target-response",
+        details: { status: response.status, bytesWritten, requestBodyState },
       });
     }
-  }
 
-  let targetResponse: TargetResponseCapture;
-  try {
-    targetResponse = await captureResponse(
+    let responseCaptureFailed = false;
+    let responseCaptureFailure: unknown;
+    activeResponseCapture = captureResponse(
       response,
       target.responseBodyLimit,
-      timedAbort.controller.signal,
+      responseAbort.signal,
+    ).then(
+      (capture) => {
+        responseCaptureCompleted = true;
+        return capture;
+      },
+      (error: unknown) => {
+        responseCaptureFailed = true;
+        responseCaptureFailure = error;
+        throw error;
+      },
     );
-  } catch (error) {
-    timedAbort.controller.signal.removeEventListener("abort", abortUpload);
-    timedAbort.clear();
-    if (timedAbort.timedOut()) {
-      throw new GatewayError("TARGET_TIMEOUT", "The target request timed out.", {
+    void activeResponseCapture.catch(() => undefined);
+
+    const statusAccepted = target.successStatus.includes(response.status);
+    if (!statusAccepted) {
+      const cancellation = cancelUpload("target status rejected");
+      const [captureOutcome] = await Promise.all([
+        activeResponseCapture.then(
+          (capture) => ({ ok: true as const, capture }),
+          (error: unknown) => ({ ok: false as const, error }),
+        ),
+        Promise.allSettled([uploadCompletion, cancellation]),
+      ]);
+      if (!captureOutcome.ok) {
+        if (timedAbort.timedOut()) {
+          throw new GatewayError("TARGET_TIMEOUT", "The target request timed out.", {
+            stage: "target-response",
+            retryable: true,
+            cause: captureOutcome.error,
+            details: { bytesWritten, requestBodyState },
+          });
+        }
+        throw new GatewayError("TARGET_FETCH_FAILED", "The target response could not be read.", {
+          stage: "target-response",
+          retryable: true,
+          cause: captureOutcome.error,
+          details: { bytesWritten, requestBodyState },
+        });
+      }
+      throw new GatewayError("TARGET_STATUS_REJECTED", "The target status was rejected.", {
         stage: "target-response",
-        retryable: true,
-        cause: error,
+        retryable: response.status >= 500,
+        details: {
+          status: response.status,
+          targetResponse: captureOutcome.capture,
+          bytesWritten,
+          requestBodyState,
+        },
       });
     }
-    throw new GatewayError("TARGET_FETCH_FAILED", "The target response could not be read.", {
-      stage: "target-response",
-      retryable: true,
-      cause: error,
-    });
-  }
-  timedAbort.controller.signal.removeEventListener("abort", abortUpload);
-  timedAbort.clear();
 
-  if (!statusAccepted) {
-    throw new GatewayError("TARGET_STATUS_REJECTED", "The target status was rejected.", {
-      stage: "target-response",
-      retryable: response.status >= 500,
-      details: {
-        status: response.status,
-        targetResponse,
-        bytesWritten,
+    let uploadFailed = false;
+    let uploadFailure: unknown;
+    const monitoredUpload = uploadCompletion.then(
+      () => undefined,
+      (error: unknown) => {
+        uploadFailed = true;
+        uploadFailure = error;
+        throw error;
       },
-    });
-  }
+    );
+    void monitoredUpload.catch(() => undefined);
 
-  return {
-    targetStatus: response.status,
-    bytesWritten,
-    targetResponse,
-  };
+    try {
+      const [, targetResponse] = await Promise.all([monitoredUpload, activeResponseCapture]);
+      return {
+        targetStatus: response.status,
+        bytesWritten,
+        targetResponse,
+      };
+    } catch (error) {
+      const uploadFailedBeforeCancellation = uploadFailed;
+      const responseFailedBeforeCancellation = responseCaptureFailed;
+      responseAbort.abort(error);
+      const cancellation = cancelUpload(error);
+      await Promise.allSettled([monitoredUpload, activeResponseCapture, cancellation]);
+
+      if (timedAbort.timedOut()) {
+        throw new GatewayError("TARGET_TIMEOUT", "The target request timed out.", {
+          stage: timeoutStage,
+          retryable: true,
+          cause: error,
+          details: { bytesWritten, requestBodyState },
+        });
+      }
+      if (sourceFailure instanceof GatewayError) throw sourceFailure;
+      if (uploadFailedBeforeCancellation && !responseFailedBeforeCancellation) {
+        if (uploadFailure instanceof GatewayError) throw uploadFailure;
+        throw new GatewayError("TARGET_BODY_REJECTED", "The target rejected the request body.", {
+          stage: "target-upload",
+          retryable: true,
+          cause: uploadFailure,
+          details: { bytesWritten, requestBodyState },
+        });
+      }
+      throw new GatewayError("TARGET_FETCH_FAILED", "The target response could not be read.", {
+        stage: "target-response",
+        retryable: true,
+        cause: responseCaptureFailure ?? error,
+        details: { bytesWritten, requestBodyState },
+      });
+    }
+  } catch (error) {
+    responseAbort.abort(error);
+    const cancellation = cancelUpload(error);
+    await Promise.allSettled([
+      uploadCompletion,
+      cancellation,
+      ...(activeResponseCapture === undefined ? [] : [activeResponseCapture]),
+    ]);
+    throw error;
+  } finally {
+    timedAbort.controller.signal.removeEventListener("abort", abortExchange);
+    if (cancelUploadPromise !== undefined) await cancelUploadPromise.catch(() => undefined);
+    await Promise.allSettled([uploadCompletion]);
+    timedAbort.clear();
+  }
 }

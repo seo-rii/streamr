@@ -124,8 +124,103 @@ function fakeArchive(entries: readonly FakeEntry[], throwAfter?: number): FakeAr
   };
 }
 
-function selector(path: string, occurrence = 1, required = true): EntrySelector {
-  return { path, occurrence, required };
+function pendingIteratorArchive(): {
+  archive: OpenedArchive;
+  abort: ReturnType<typeof vi.fn>;
+  nextPendingStarted: Promise<void>;
+  iteratorReturned: Promise<void>;
+} {
+  let rejectPendingNext: (reason: unknown) => void = () => undefined;
+  let markNextPendingStarted: () => void = () => undefined;
+  let markIteratorReturned: () => void = () => undefined;
+  const pendingNext = new Promise<never>((_resolve, reject) => {
+    rejectPendingNext = reject;
+  });
+  const nextPendingStarted = new Promise<void>((resolve) => {
+    markNextPendingStarted = resolve;
+  });
+  const iteratorReturned = new Promise<void>((resolve) => {
+    markIteratorReturned = resolve;
+  });
+  const abort = vi.fn((reason?: unknown) => {
+    rejectPendingNext(
+      reason instanceof Error
+        ? reason
+        : new GatewayError("PIPELINE_ABORTED", "Synthetic archive abort.", {
+            stage: "archive-read",
+            cause: reason,
+          }),
+    );
+  });
+  let nextCalls = 0;
+  let consumed = false;
+  const entry: ArchiveEntryHandle = {
+    index: 1,
+    path: "available.txt",
+    occurrence: 1,
+    unsafePath: false,
+    type: "file",
+    contentType: "text/plain; charset=utf-8",
+    async open(): Promise<ByteStream> {
+      if (consumed) throw new Error("pending entry consumed twice");
+      consumed = true;
+      return {
+        stream: new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(encoder.encode("body"));
+            controller.close();
+          },
+        }),
+        knownLength: 4,
+        contentType: "text/plain; charset=utf-8",
+        filename: "available.txt",
+        abort: vi.fn(),
+      };
+    },
+    async skip() {
+      if (consumed) throw new Error("pending entry consumed twice");
+      consumed = true;
+    },
+  };
+  const iterator: AsyncIterator<ArchiveEntryHandle> = {
+    async next(): Promise<IteratorResult<ArchiveEntryHandle>> {
+      nextCalls += 1;
+      if (nextCalls === 1) return { done: false, value: entry };
+      markNextPendingStarted();
+      return pendingNext;
+    },
+    async return(): Promise<IteratorResult<ArchiveEntryHandle, undefined>> {
+      rejectPendingNext(
+        new GatewayError("PIPELINE_ABORTED", "Synthetic iterator return.", {
+          stage: "archive-read",
+        }),
+      );
+      markIteratorReturned();
+      return { done: true, value: undefined };
+    },
+  };
+
+  const archive: OpenedArchive = {
+    format: "test",
+    layers: ["test"],
+    entries: {
+      [Symbol.asyncIterator](): AsyncIterator<ArchiveEntryHandle> {
+        return iterator;
+      },
+    },
+    abort,
+  };
+
+  return { archive, abort, nextPendingStarted, iteratorReturned };
+}
+
+function selector(
+  path: string,
+  occurrence = 1,
+  required = true,
+  id?: string,
+): EntrySelector {
+  return { ...(id === undefined ? {} : { id }), path, occurrence, required };
 }
 
 async function render(
@@ -155,7 +250,11 @@ describe("multipart/mixed archive output", () => {
       { path: "B.txt", body: "body-b" },
       { path: "C.txt", body: "body-c" },
     ]);
-    const output = await render(source, [selector("C.txt"), selector("A.txt"), selector("B.txt")]);
+    const output = await render(source, [
+      selector("C.txt", 1, true, "selector-c"),
+      selector("A.txt", 1, true, "selector-a"),
+      selector("B.txt", 1, false, "selector-b"),
+    ]);
 
     expect(output.text.indexOf("X-Archive-Path: A.txt")).toBeLessThan(
       output.text.indexOf("X-Archive-Path: B.txt"),
@@ -163,12 +262,47 @@ describe("multipart/mixed archive output", () => {
     expect(output.text.indexOf("X-Archive-Path: B.txt")).toBeLessThan(
       output.text.indexOf("X-Archive-Path: C.txt"),
     );
+    expect(output.text).toContain("X-Stream-Gateway-Selector-Id: selector-a");
+    expect(output.text).toContain("X-Stream-Gateway-Selector-Path: A.txt");
+    expect(output.text).toContain("X-Stream-Gateway-Selector-Occurrence: 1");
+    expect(output.text).toContain("X-Stream-Gateway-Selector-Required: true");
     expect(output.manifest).toEqual({
       ok: true,
       requested: 3,
       emitted: 3,
       missing: [],
       errors: [],
+      selectors: [
+        {
+          id: "selector-c",
+          path: "C.txt",
+          occurrence: 1,
+          required: true,
+          status: "emitted",
+          archiveIndex: 3,
+        },
+        {
+          id: "selector-a",
+          path: "A.txt",
+          occurrence: 1,
+          required: true,
+          status: "emitted",
+          archiveIndex: 1,
+        },
+        {
+          id: "selector-b",
+          path: "B.txt",
+          occurrence: 1,
+          required: false,
+          status: "emitted",
+          archiveIndex: 2,
+        },
+      ],
+      archive: {
+        fullyScanned: false,
+        stoppedEarly: true,
+        integrityScope: "selected-entries",
+      },
     });
     expect(output.text.endsWith(`--${output.boundary}--\r\n`)).toBe(true);
   });
@@ -200,6 +334,25 @@ describe("multipart/mixed archive output", () => {
       requested: 2,
       emitted: 0,
       missing: ["required.txt", "optional.txt"],
+      selectors: [
+        {
+          path: "required.txt",
+          occurrence: 1,
+          required: true,
+          status: "missing",
+        },
+        {
+          path: "optional.txt",
+          occurrence: 1,
+          required: false,
+          status: "missing",
+        },
+      ],
+      archive: {
+        fullyScanned: true,
+        stoppedEarly: false,
+        integrityScope: "full-archive",
+      },
     });
 
     const optionalMissing = await render(fakeArchive([{ path: "required.txt", body: "ok" }]), [
@@ -211,16 +364,38 @@ describe("multipart/mixed archive output", () => {
       requested: 2,
       emitted: 1,
       missing: ["optional.txt"],
+      selectors: [
+        expect.objectContaining({ path: "optional.txt", status: "missing" }),
+        expect.objectContaining({ path: "required.txt", status: "emitted", archiveIndex: 1 }),
+      ],
+      archive: {
+        fullyScanned: true,
+        stoppedEarly: false,
+        integrityScope: "full-archive",
+      },
     });
   });
 
   it("RFC5987-encodes UTF-8, quote, and path separators in part headers", async () => {
     const path = '자료/한 "파일".txt';
-    const output = await render(fakeArchive([{ path, body: "content" }]), [selector(path)]);
+    const output = await render(fakeArchive([{ path, body: "content" }]), [
+      selector(path, 1, true, '선택 "1"'),
+    ]);
     expect(output.text).toContain("filename*=UTF-8''%ED%95%9C%20%22%ED%8C%8C%EC%9D%BC%22.txt");
     expect(output.text).toContain(
       "X-Archive-Path: %EC%9E%90%EB%A3%8C%2F%ED%95%9C%20%22%ED%8C%8C%EC%9D%BC%22.txt",
     );
+    expect(output.text).toContain(
+      "X-Stream-Gateway-Selector-Id: %EC%84%A0%ED%83%9D%20%221%22",
+    );
+    expect(output.manifest.selectors[0]).toMatchObject({
+      id: '선택 "1"',
+      path,
+      occurrence: 1,
+      required: true,
+      status: "emitted",
+      archiveIndex: 1,
+    });
   });
 
   it("applies common transforms independently to every selected entry", async () => {
@@ -255,10 +430,52 @@ describe("multipart/mixed archive output", () => {
 
     expect(output.text).toContain("first-body");
     expect(output.text).not.toContain("second-body");
-    expect(output.manifest).toMatchObject({ ok: false, requested: 2, emitted: 1, missing: [] });
+    expect(output.manifest).toMatchObject({
+      ok: false,
+      requested: 2,
+      emitted: 1,
+      missing: [],
+      selectors: [
+        expect.objectContaining({
+          path: "first.txt",
+          status: "emitted",
+          archiveIndex: 1,
+        }),
+        expect.objectContaining({ path: "second.txt", status: "unresolved" }),
+      ],
+      archive: {
+        fullyScanned: false,
+        stoppedEarly: false,
+        integrityScope: "partial-archive",
+      },
+    });
     expect(output.manifest.errors).toContainEqual({
       code: "CORRUPT_ARCHIVE",
       stage: "archive-read",
+    });
+  });
+
+  it("reports selected-entry integrity when it stops before validating the archive tail", async () => {
+    const output = await render(
+      fakeArchive(
+        [
+          { path: "selected.txt", body: "selected" },
+          { path: "tail.txt", body: "tail" },
+        ],
+        1,
+      ),
+      [selector("selected.txt")],
+    );
+
+    expect(output.manifest).toMatchObject({
+      ok: true,
+      missing: [],
+      errors: [],
+      archive: {
+        fullyScanned: false,
+        stoppedEarly: true,
+        integrityScope: "selected-entries",
+      },
     });
   });
 
@@ -289,6 +506,12 @@ describe("multipart/mixed archive output", () => {
       emitted: 0,
       missing: [],
       errors: [],
+      selectors: [],
+      archive: {
+        fullyScanned: false,
+        stoppedEarly: true,
+        integrityScope: "selected-entries",
+      },
     });
     expect(output.text.match(/Content-Type: application\/json/g)).toHaveLength(1);
   });
@@ -312,6 +535,71 @@ describe("multipart/mixed archive output", () => {
     const text = await new Response(decoded).text();
     expect(text).toContain("payload");
     expect(text).toContain("X-Stream-Gateway-Control: manifest");
+  });
+
+  it("rejects a final byte limit because it could truncate the manifest", async () => {
+    const source = fakeArchive([{ path: "limited.txt", body: "payload" }]);
+
+    await expect(
+      createMultipartMixedStream(
+        source.archive,
+        [selector("limited.txt")],
+        [],
+        [{ type: "limit", maxBytes: 1 }],
+      ),
+    ).rejects.toMatchObject({
+      code: "INVALID_TRANSFORM",
+      stage: "transform-validate",
+    });
+    expect(source.abort).not.toHaveBeenCalled();
+  });
+
+  it("does not enqueue a pending iterator result after consumer cancellation", async () => {
+    const source = pendingIteratorArchive();
+    const result = await createMultipartMixedStream(source.archive, [
+      selector("available.txt"),
+      selector("missing.txt"),
+    ]);
+    const reader = result.byteStream.stream.getReader();
+
+    const header = await reader.read();
+    expect(new TextDecoder().decode(header.value)).toContain("X-Archive-Path: available.txt");
+    await reader.read();
+    await reader.read();
+    const pendingRead = reader.read();
+    await source.nextPendingStarted;
+    await reader.cancel("client disconnected while iterator.next was pending");
+
+    await expect(pendingRead).resolves.toEqual({ done: true, value: undefined });
+    await source.iteratorReturned;
+    expect(source.abort).toHaveBeenCalled();
+  });
+
+  it("errors a pending read once and cleans up the iterator on signal abort", async () => {
+    const source = pendingIteratorArchive();
+    const controller = new AbortController();
+    const result = await createMultipartMixedStream(
+      source.archive,
+      [selector("available.txt"), selector("missing.txt")],
+      [],
+      [],
+      controller.signal,
+    );
+    const reader = result.byteStream.stream.getReader();
+
+    await reader.read();
+    await reader.read();
+    await reader.read();
+    const pendingRead = reader.read();
+    await source.nextPendingStarted;
+    controller.abort("request aborted");
+
+    await expect(pendingRead).rejects.toMatchObject({
+      code: "PIPELINE_ABORTED",
+      stage: "multipart-mixed",
+    });
+    await source.iteratorReturned;
+    expect(source.abort).toHaveBeenCalled();
   });
 
   it("aborts the archive when the multipart consumer disconnects", async () => {

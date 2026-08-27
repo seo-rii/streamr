@@ -179,6 +179,32 @@ describe("archive HTTP data plane", () => {
     });
   });
 
+  it("returns CORRUPT_ARCHIVE for a contradictory ZIP central-directory size", async () => {
+    const archive = makeZip([{ path: "inside.txt", body: "zip" }]).slice();
+    const eocdOffset = archive.byteLength - 22;
+    new DataView(archive.buffer, archive.byteOffset, archive.byteLength).setUint32(
+      eocdOffset + 12,
+      4,
+      true,
+    );
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => archiveResponse(archive, "application/zip")),
+    );
+
+    const response = await exports.default.fetch(
+      authenticatedJson("/v1/list", {
+        source: { url: "https://source.test/archive.zip" },
+      }),
+    );
+
+    expect(response.status).toBe(422);
+    await expect(response.json()).resolves.toMatchObject({
+      ok: false,
+      error: { code: "CORRUPT_ARCHIVE", stage: "archive-read" },
+    });
+  });
+
   it("lists TAR duplicate occurrences and unsafe-path metadata", async () => {
     const archive = await packTar([
       { header: { name: "same.txt", size: 5 }, body: "first" },
@@ -235,6 +261,9 @@ describe("archive HTTP data plane", () => {
     expect(selected.status).toBe(200);
     expect(selected.headers.get("Content-Type")).toBe("text/plain; charset=utf-8");
     expect(selected.headers.get("Content-Disposition")).toContain("selected.in");
+    expect(selected.headers.get("X-Stream-Gateway-Integrity-Scope")).toBe(
+      "selected-entry",
+    );
     await expect(selected.text()).resolves.toBe("selected\n");
 
     const missing = await exports.default.fetch(

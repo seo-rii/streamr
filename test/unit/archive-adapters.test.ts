@@ -128,8 +128,12 @@ async function extractAllFiles(
   return files;
 }
 
-async function drainArchive(adapter: ArchiveAdapter, bytes: Uint8Array): Promise<void> {
-  const input = testByteStream(bytes, 31);
+async function drainArchive(
+  adapter: ArchiveAdapter,
+  bytes: Uint8Array,
+  chunkSize = 31,
+): Promise<void> {
+  const input = testByteStream(bytes, chunkSize);
   for await (const entry of adapter.entries(input.byteStream, { listMode: true })) {
     await entry.skip();
   }
@@ -166,6 +170,65 @@ function zipLocalHeaderOffsets(archive: Uint8Array): number[] {
     }
   }
   return offsets;
+}
+
+function zipEocdOffset(archive: Uint8Array): number {
+  const view = new DataView(archive.buffer, archive.byteOffset, archive.byteLength);
+  for (let offset = archive.byteLength - 22; offset >= 0; offset -= 1) {
+    if (
+      view.getUint32(offset, true) === 0x06054b50 &&
+      offset + 22 + view.getUint16(offset + 20, true) === archive.byteLength
+    ) {
+      return offset;
+    }
+  }
+  throw new Error("expected a ZIP EOCD record");
+}
+
+function nextZipCentralHeader(archive: Uint8Array, offset: number): number {
+  const view = new DataView(archive.buffer, archive.byteOffset, archive.byteLength);
+  if (view.getUint32(offset, true) !== 0x02014b50) {
+    throw new Error("expected a ZIP central-directory header");
+  }
+  return (
+    offset +
+    46 +
+    view.getUint16(offset + 28, true) +
+    view.getUint16(offset + 30, true) +
+    view.getUint16(offset + 32, true)
+  );
+}
+
+function wrapZip64Eocd(archive: Uint8Array): Uint8Array {
+  const eocdOffset = zipEocdOffset(archive);
+  const original = new DataView(archive.buffer, archive.byteOffset, archive.byteLength);
+  const entries = original.getUint16(eocdOffset + 10, true);
+  const centralSize = original.getUint32(eocdOffset + 12, true);
+  const centralOffset = original.getUint32(eocdOffset + 16, true);
+  const zip64 = new Uint8Array(56);
+  const zip64View = new DataView(zip64.buffer);
+  zip64View.setUint32(0, 0x06064b50, true);
+  zip64View.setBigUint64(4, 44n, true);
+  zip64View.setUint16(12, 45, true);
+  zip64View.setUint16(14, 45, true);
+  zip64View.setBigUint64(24, BigInt(entries), true);
+  zip64View.setBigUint64(32, BigInt(entries), true);
+  zip64View.setBigUint64(40, BigInt(centralSize), true);
+  zip64View.setBigUint64(48, BigInt(centralOffset), true);
+
+  const locator = new Uint8Array(20);
+  const locatorView = new DataView(locator.buffer);
+  locatorView.setUint32(0, 0x07064b50, true);
+  locatorView.setBigUint64(8, BigInt(eocdOffset), true);
+  locatorView.setUint32(16, 1, true);
+
+  const eocd = archive.slice(eocdOffset);
+  const eocdView = new DataView(eocd.buffer, eocd.byteOffset, eocd.byteLength);
+  eocdView.setUint16(8, 0xffff, true);
+  eocdView.setUint16(10, 0xffff, true);
+  eocdView.setUint32(12, 0xffff_ffff, true);
+  eocdView.setUint32(16, 0xffff_ffff, true);
+  return concat([archive.subarray(0, eocdOffset), zip64, locator, eocd]);
 }
 
 describe("archive path normalization", () => {
@@ -286,6 +349,92 @@ describe("ZIP archive adapter", () => {
     await expect(drainArchive(new ZipAdapter(), withoutCentralDirectory)).rejects.toMatchObject({
       code: "CORRUPT_ARCHIVE",
     });
+  });
+
+  it("rejects an EOCD that describes a four-byte fake central directory", async () => {
+    const contradictory = makeZip([{ path: "one.txt", data: "one" }]).slice();
+    const eocdOffset = zipEocdOffset(contradictory);
+    new DataView(
+      contradictory.buffer,
+      contradictory.byteOffset,
+      contradictory.byteLength,
+    ).setUint32(eocdOffset + 12, 4, true);
+
+    await expect(drainArchive(new ZipAdapter(), contradictory)).rejects.toMatchObject({
+      code: "CORRUPT_ARCHIVE",
+    });
+  });
+
+  it("rejects a malformed record after a valid first central-directory record", async () => {
+    const malformed = makeZip([
+      { path: "one.txt", data: "one" },
+      { path: "two.txt", data: "two", compression: "deflate" },
+    ]).slice();
+    const view = new DataView(malformed.buffer, malformed.byteOffset, malformed.byteLength);
+    const centralOffset = view.getUint32(zipEocdOffset(malformed) + 16, true);
+    const secondCentralOffset = nextZipCentralHeader(malformed, centralOffset);
+    malformed[secondCentralOffset + 3] = 0;
+
+    await expect(drainArchive(new ZipAdapter(), malformed)).rejects.toMatchObject({
+      code: "CORRUPT_ARCHIVE",
+    });
+  });
+
+  it("rejects a central-directory record truncated within its declared filename", async () => {
+    const truncated = makeZip([{ path: "inside.txt", data: "data" }]).slice();
+    const view = new DataView(truncated.buffer, truncated.byteOffset, truncated.byteLength);
+    const centralOffset = view.getUint32(zipEocdOffset(truncated) + 16, true);
+    view.setUint16(centralOffset + 28, 0xffff, true);
+
+    await expect(drainArchive(new ZipAdapter(), truncated)).rejects.toMatchObject({
+      code: "CORRUPT_ARCHIVE",
+    });
+  });
+
+  it("rejects an EOCD offset that skips a central-directory record", async () => {
+    const contradictory = makeZip([
+      { path: "one.txt", data: "one" },
+      { path: "two.txt", data: "two" },
+    ]).slice();
+    const eocdOffset = zipEocdOffset(contradictory);
+    const view = new DataView(
+      contradictory.buffer,
+      contradictory.byteOffset,
+      contradictory.byteLength,
+    );
+    const firstCentralOffset = view.getUint32(eocdOffset + 16, true);
+    const secondCentralOffset = nextZipCentralHeader(contradictory, firstCentralOffset);
+    view.setUint32(eocdOffset + 16, secondCentralOffset, true);
+    view.setUint32(eocdOffset + 12, eocdOffset - secondCentralOffset, true);
+
+    await expect(drainArchive(new ZipAdapter(), contradictory)).rejects.toMatchObject({
+      code: "CORRUPT_ARCHIVE",
+    });
+  });
+
+  it("validates a central directory larger than the retained ZIP tail", async () => {
+    const entries = Array.from({ length: 1_100 }, (_, index) => ({
+      path: `files/${String(index).padStart(4, "0")}-${"x".repeat(80)}.txt`,
+    }));
+    const archive = makeZip(entries);
+    const view = new DataView(archive.buffer, archive.byteOffset, archive.byteLength);
+    expect(view.getUint32(zipEocdOffset(archive) + 12, true)).toBeGreaterThan(132 * 1024);
+
+    await expect(drainArchive(new ZipAdapter(), archive, 64 * 1024)).resolves.toBeUndefined();
+  });
+
+  it("preserves ZIP64 EOCD validation for stored and deflated entries", async () => {
+    const archive = wrapZip64Eocd(
+      makeZip([
+        { path: "stored.txt", data: "stored" },
+        { path: "deflated.txt", data: "deflated", compression: "deflate" },
+      ]),
+    );
+
+    await expect(extractAllFiles(new ZipAdapter(), archive)).resolves.toEqual([
+      { path: "stored.txt", body: "stored" },
+      { path: "deflated.txt", body: "deflated" },
+    ]);
   });
 
   it("rejects stored entry data that does not match its CRC", async () => {

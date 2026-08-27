@@ -5,7 +5,7 @@ import type { ByteStream } from "../streams/byte-stream";
 
 const XZ_OK = 0;
 const XZ_STREAM_END = 1;
-const XZ_MEMORY_LIMIT = 64 * 1024 * 1024;
+const XZ_MEMORY_LIMIT = LIMITS.xzDecoderMemoryBytes;
 
 interface XzExports extends WebAssembly.Exports {
   memory: WebAssembly.Memory;

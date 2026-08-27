@@ -5,7 +5,8 @@ import type { ByteStream } from "../streams/byte-stream";
 import type { DecompressionOptions } from "./bzip2";
 
 const ZSTD_INPUT_BATCH = 4 * 1024;
-const ZSTD_CALLBACK_QUEUE_BYTES = 16 * 1024 * 1024;
+const ZSTD_CALLBACK_QUEUE_BYTES = LIMITS.decoderBurstBytes;
+const ZSTD_WINDOW_BYTES = LIMITS.zstdWindowBytes;
 const EMPTY = new Uint8Array();
 
 function decompressionError(error: unknown): GatewayError {
@@ -18,11 +19,11 @@ function decompressionError(error: unknown): GatewayError {
   ) {
     return new GatewayError(
       "UNSUPPORTED_COMPRESSION",
-      "The ZSTD frame requires a decoder window larger than 32 MiB.",
+      "The ZSTD frame requires a decoder window larger than 16 MiB.",
       {
         stage: "decompress",
         cause: error,
-        details: { format: "zstd", maxWindowBytes: 32 * 1024 * 1024 },
+        details: { format: "zstd", maxWindowBytes: ZSTD_WINDOW_BYTES },
       },
     );
   }

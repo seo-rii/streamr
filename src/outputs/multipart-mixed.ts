@@ -18,7 +18,7 @@ import { inferByteStreamContentType } from "../util/mime";
 import type { ArchiveEntryHandle, OpenedArchive } from "../archive/types";
 
 const encoder = new TextEncoder();
-const MULTIPART_METADATA_BUDGET = 16 * 1024 * 1024;
+const MULTIPART_METADATA_BUDGET = LIMITS.operationMetadataBytes;
 
 interface NormalizedSelector {
   id?: string;
@@ -27,6 +27,7 @@ interface NormalizedSelector {
   required: boolean;
   matched: boolean;
   completed: boolean;
+  archiveIndex?: number;
 }
 
 export interface MultipartManifestError {
@@ -43,6 +44,23 @@ export interface MultipartMixedManifest {
   emitted: number;
   missing: string[];
   errors: MultipartManifestError[];
+  selectors: MultipartSelectorResult[];
+  archive: MultipartArchiveIntegrity;
+}
+
+export interface MultipartSelectorResult {
+  id?: string;
+  path: string;
+  occurrence: number;
+  required: boolean;
+  status: "emitted" | "failed" | "missing" | "unresolved";
+  archiveIndex?: number;
+}
+
+export interface MultipartArchiveIntegrity {
+  fullyScanned: boolean;
+  stoppedEarly: boolean;
+  integrityScope: "full-archive" | "selected-entries" | "partial-archive";
 }
 
 export interface MultipartMixedStreamResult {
@@ -52,6 +70,20 @@ export interface MultipartMixedStreamResult {
 
 export interface MultipartMixedStats {
   entriesScanned: number;
+}
+
+/** A byte limit could truncate the mandatory manifest, so only gzip is safe here. */
+export function validateMultipartFinalTransforms(
+  transforms: readonly FinalTransformSpec[],
+): void {
+  validateFinalTransforms(transforms);
+  if (transforms.some((transform) => transform.type !== "gzip")) {
+    throw new GatewayError(
+      "INVALID_TRANSFORM",
+      "A multipart/mixed final transform must preserve the mandatory manifest; only gzip is allowed.",
+      { stage: "transform-validate" },
+    );
+  }
 }
 
 /**
@@ -68,7 +100,7 @@ export async function createMultipartMixedStream(
 ): Promise<MultipartMixedStreamResult> {
   const normalizedSelectors = normalizeSelectors(selectors);
   validateEntryTransforms(entryTransforms, { allowMultipartFormData: false });
-  validateFinalTransforms(finalTransforms);
+  validateMultipartFinalTransforms(finalTransforms);
   validateCombinedTransforms(entryTransforms, finalTransforms);
 
   if (signal?.aborted === true) {
@@ -158,6 +190,7 @@ async function* encodeMultipartArchive(
   let unresolved = selectors.length;
   let archiveCompleted = false;
   let archiveFailed = false;
+  let stoppedEarly = false;
   let iterator: AsyncIterator<ArchiveEntryHandle> | undefined;
 
   try {
@@ -191,6 +224,7 @@ async function* encodeMultipartArchive(
       }
 
       selector.matched = true;
+      selector.archiveIndex = entry.index;
       unresolved -= 1;
       if (entry.type !== "file") {
         try {
@@ -231,7 +265,7 @@ async function* encodeMultipartArchive(
         transformed = limitEntryBytes(transformed);
         transformed = await inferByteStreamContentType(transformed);
 
-        yield encodePartHeaders(boundary, entry, transformed);
+        yield encodePartHeaders(boundary, entry, selector, transformed);
         partStarted = true;
         for await (const chunk of inputChunks(transformed)) yield chunk;
         await shield.waitForCompletion();
@@ -254,8 +288,14 @@ async function* encodeMultipartArchive(
     }
 
     if (unresolved === 0 && !archiveCompleted && !archiveFailed) {
+      stoppedEarly = true;
       archive.abort("all selected archive entries were processed");
-      await iterator.return?.();
+      try {
+        await iterator.return?.();
+      } catch (error) {
+        archiveFailed = true;
+        addManifestError(errors, errorKeys, error);
+      }
     } else if (!archiveFailed && !archiveCompleted) {
       try {
         for (;;) {
@@ -284,6 +324,16 @@ async function* encodeMultipartArchive(
       emitted,
       missing,
       errors,
+      selectors: selectors.map((selector) => selectorResult(selector, archiveCompleted)),
+      archive: {
+        fullyScanned: archiveCompleted,
+        stoppedEarly,
+        integrityScope: archiveCompleted
+          ? "full-archive"
+          : archiveFailed
+            ? "partial-archive"
+            : "selected-entries",
+      },
     };
     onManifest?.(manifest, { entriesScanned });
     yield encodeManifest(boundary, manifest);
@@ -298,6 +348,7 @@ async function* encodeMultipartArchive(
 function encodePartHeaders(
   boundary: string,
   entry: ArchiveEntryHandle,
+  selector: NormalizedSelector,
   transformed: ByteStream,
 ): Uint8Array {
   const filename = transformed.filename ?? entry.path.split("/").at(-1) ?? "entry";
@@ -313,8 +364,37 @@ function encodePartHeaders(
       `Content-Type: ${contentType}\r\n` +
       `Content-Disposition: attachment; filename*=UTF-8''${encodeRfc5987(filename)}\r\n` +
       `X-Archive-Path: ${encodeRfc5987(entry.path)}\r\n` +
-      `X-Archive-Index: ${entry.index}\r\n\r\n`,
+      `X-Archive-Index: ${entry.index}\r\n` +
+      (selector.id === undefined
+        ? ""
+        : `X-Stream-Gateway-Selector-Id: ${encodeRfc5987(selector.id)}\r\n`) +
+      `X-Stream-Gateway-Selector-Path: ${encodeRfc5987(selector.path)}\r\n` +
+      `X-Stream-Gateway-Selector-Occurrence: ${selector.occurrence}\r\n` +
+      `X-Stream-Gateway-Selector-Required: ${selector.required}\r\n\r\n`,
   );
+}
+
+function selectorResult(
+  selector: NormalizedSelector,
+  archiveCompleted: boolean,
+): MultipartSelectorResult {
+  const status = selector.completed
+    ? "emitted"
+    : selector.matched
+      ? "failed"
+      : archiveCompleted
+        ? "missing"
+        : "unresolved";
+  return {
+    ...(selector.id === undefined ? {} : { id: selector.id }),
+    path: selector.path,
+    occurrence: selector.occurrence,
+    required: selector.required,
+    status,
+    ...(selector.archiveIndex === undefined
+      ? {}
+      : { archiveIndex: selector.archiveIndex }),
+  };
 }
 
 function encodeManifest(boundary: string, manifest: MultipartMixedManifest): Uint8Array {
@@ -376,19 +456,44 @@ function iteratorByteStream(
   signal: AbortSignal | undefined,
   metadata: { contentType: string },
 ): ByteStream {
-  let finished = false;
+  let state: "open" | "closed" | "cancelled" | "errored" = "open";
   let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
+  let returnPromise: Promise<void> | undefined;
+
+  const removeAbortListener = () =>
+    signal?.removeEventListener("abort", abortFromSignal);
+  const returnIterator = (): Promise<void> => {
+    returnPromise ??= (async () => {
+      try {
+        await iterator.return?.();
+      } catch {
+        // The archive abort is authoritative; iterator cleanup is best effort.
+      }
+    })();
+    return returnPromise;
+  };
+  const pipelineAborted = (reason?: unknown) =>
+    new GatewayError("PIPELINE_ABORTED", "The multipart stream was aborted.", {
+      stage: "multipart-mixed",
+      cause: reason,
+    });
   const abortFromSignal = () => {
-    if (finished) return;
-    finished = true;
-    archive.abort(signal?.reason);
-    void iterator.return?.().catch(() => undefined);
-    controller?.error(
-      new GatewayError("PIPELINE_ABORTED", "The multipart stream was aborted.", {
-        stage: "multipart-mixed",
-        cause: signal?.reason,
-      }),
-    );
+    if (state !== "open") return;
+    state = "errored";
+    removeAbortListener();
+    const error = pipelineAborted(signal?.reason);
+    archive.abort(error);
+    void returnIterator();
+    controller?.error(error);
+  };
+  const abortByteStream = (reason?: unknown) => {
+    if (state !== "open") return;
+    state = "errored";
+    removeAbortListener();
+    const error = pipelineAborted(reason);
+    archive.abort(error);
+    void returnIterator();
+    controller?.error(error);
   };
 
   const stream = new ReadableStream<Uint8Array>({
@@ -397,29 +502,33 @@ function iteratorByteStream(
       signal?.addEventListener("abort", abortFromSignal, { once: true });
     },
     async pull(streamController) {
-      if (finished) return;
+      if (state !== "open") return;
       try {
         const result = await iterator.next();
+        // cancel(), AbortSignal, or ByteStream.abort() can win while next() is pending.
+        if (state !== "open") return;
         if (result.done) {
-          finished = true;
-          signal?.removeEventListener("abort", abortFromSignal);
+          state = "closed";
+          removeAbortListener();
           streamController.close();
         } else {
           streamController.enqueue(result.value);
         }
       } catch (error) {
-        finished = true;
-        signal?.removeEventListener("abort", abortFromSignal);
+        if (state !== "open") return;
+        state = "errored";
+        removeAbortListener();
         archive.abort(error);
+        await returnIterator();
         streamController.error(error);
       }
     },
     async cancel(reason) {
-      if (finished) return;
-      finished = true;
-      signal?.removeEventListener("abort", abortFromSignal);
+      if (state !== "open") return;
+      state = "cancelled";
+      removeAbortListener();
       archive.abort(reason);
-      await iterator.return?.();
+      await returnIterator();
     },
   });
 
@@ -427,7 +536,7 @@ function iteratorByteStream(
     stream,
     contentType: metadata.contentType,
     abort(reason) {
-      archive.abort(reason);
+      abortByteStream(reason);
     },
   };
 }

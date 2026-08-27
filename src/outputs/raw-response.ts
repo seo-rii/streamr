@@ -14,7 +14,11 @@ export function rawResponse(
     filename?: string | undefined;
   },
 ): Response {
-  const headers = new Headers({ "Cache-Control": "no-store" });
+  const headers = new Headers({
+    "Cache-Control": "no-store",
+    "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff",
+  });
   const contentType = output.contentType ?? byteStream.contentType ?? "application/octet-stream";
   if (/[\r\n]/.test(contentType)) {
     byteStream.abort("invalid content type");

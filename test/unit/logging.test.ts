@@ -132,4 +132,18 @@ describe("request completion logging", () => {
     });
     expect(output).toHaveBeenCalledOnce();
   });
+
+  it("records an MCP protocol rejection as an error", async () => {
+    const output = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const log = createRequestLogContext("mcp");
+    const response = observeResponseCompletion(
+      Response.json({ jsonrpc: "2.0", error: { code: -32600 }, id: null }, { status: 400 }),
+      log,
+    );
+
+    await response.text();
+
+    expect(parseRecord(output)).toMatchObject({ operation: "mcp", result: "error" });
+    expect(output).toHaveBeenCalledOnce();
+  });
 });
