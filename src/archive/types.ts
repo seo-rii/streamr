@@ -14,7 +14,7 @@ export interface ArchiveEntryHandle {
   occurrence: number;
   unsafePath: boolean;
   type: ArchiveEntryType;
-  size?: number;
+  size?: number | null;
   compressedSize?: number;
   compressionMethod?: string | number;
   contentType?: string;

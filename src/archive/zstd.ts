@@ -10,6 +10,22 @@ const EMPTY = new Uint8Array();
 
 function decompressionError(error: unknown): GatewayError {
   if (error instanceof GatewayError) return error;
+  if (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    error.code === 1
+  ) {
+    return new GatewayError(
+      "UNSUPPORTED_COMPRESSION",
+      "The ZSTD frame requires a decoder window larger than 32 MiB.",
+      {
+        stage: "decompress",
+        cause: error,
+        details: { format: "zstd", maxWindowBytes: 32 * 1024 * 1024 },
+      },
+    );
+  }
   return new GatewayError(
     "CORRUPT_ARCHIVE",
     "The ZSTD stream is corrupt or truncated.",

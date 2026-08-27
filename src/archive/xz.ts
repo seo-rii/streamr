@@ -80,6 +80,19 @@ class XzContext {
     return { chunk, finished: result === XZ_STREAM_END };
   }
 
+  remainingInput(): Uint8Array {
+    this.refresh();
+    const position = this.words[2] ?? 0;
+    const size = this.words[3] ?? 0;
+    if (position > size || size > this.bufferSize) {
+      throw new GatewayError("CORRUPT_ARCHIVE", "The XZ decoder input state is invalid.", {
+        stage: "decompress",
+        details: { format: "xz" },
+      });
+    }
+    return this.bytes.slice(this.inputStart + position, this.inputStart + size);
+  }
+
   dispose(): void {
     this.exports.destroy_context(this.pointer);
   }
@@ -100,7 +113,10 @@ export function decompressXz(
   let context: XzContext | undefined;
   let currentInput: Uint8Array | undefined;
   let inputOffset = 0;
+  let decoderRemainder: Uint8Array | undefined;
+  let decoderRemainderOffset = 0;
   let inputEnded = false;
+  let awaitingNextStream = false;
   let disposed = false;
   let outputBytes = 0;
 
@@ -113,14 +129,115 @@ export function decompressXz(
     await reader.cancel(reason).catch(() => undefined);
   };
 
+  const readNextCompressedByte = async (): Promise<number | undefined> => {
+    if (
+      decoderRemainder !== undefined &&
+      decoderRemainderOffset < decoderRemainder.byteLength
+    ) {
+      const value = decoderRemainder[decoderRemainderOffset];
+      decoderRemainderOffset += 1;
+      return value;
+    }
+    decoderRemainder = undefined;
+    decoderRemainderOffset = 0;
+
+    while (currentInput === undefined || inputOffset >= currentInput.byteLength) {
+      if (inputEnded) return undefined;
+      const result = await reader.read();
+      if (result.done) {
+        inputEnded = true;
+        return undefined;
+      }
+      if (result.value.byteLength === 0) continue;
+      currentInput = result.value;
+      inputOffset = 0;
+    }
+    const value = currentInput[inputOffset];
+    inputOffset += 1;
+    return value;
+  };
+
+  const startNextStream = async (): Promise<boolean> => {
+    let paddingBytes = 0;
+    let first = await readNextCompressedByte();
+    while (first === 0) {
+      paddingBytes += 1;
+      first = await readNextCompressedByte();
+    }
+    if (paddingBytes % 4 !== 0) {
+      throw new GatewayError("CORRUPT_ARCHIVE", "The XZ stream padding is invalid.", {
+        stage: "decompress",
+        details: { format: "xz" },
+      });
+    }
+    if (first === undefined) return false;
+
+    const header = new Uint8Array(6);
+    header[0] = first;
+    for (let index = 1; index < header.byteLength; index += 1) {
+      const value = await readNextCompressedByte();
+      if (value === undefined) {
+        throw new GatewayError("CORRUPT_ARCHIVE", "Trailing XZ data is truncated.", {
+          stage: "decompress",
+          details: { format: "xz" },
+        });
+      }
+      header[index] = value;
+    }
+    if (
+      header[0] !== 0xfd ||
+      header[1] !== 0x37 ||
+      header[2] !== 0x7a ||
+      header[3] !== 0x58 ||
+      header[4] !== 0x5a ||
+      header[5] !== 0x00
+    ) {
+      throw new GatewayError("CORRUPT_ARCHIVE", "Unexpected data follows the XZ stream.", {
+        stage: "decompress",
+        details: { format: "xz" },
+      });
+    }
+
+    context = new XzContext();
+    context.supplyInput(header);
+    return true;
+  };
+
   const stream = new ReadableStream<Uint8Array>({
     start() {
       context = new XzContext();
     },
     async pull(controller) {
       try {
+        if (awaitingNextStream) {
+          if (!(await startNextStream())) {
+            await cleanup("XZ stream complete");
+            controller.close();
+            return;
+          }
+          awaitingNextStream = false;
+        }
         if (context === undefined) throw new Error("XZ decoder was not initialized");
         while (context.needsInput()) {
+          if (
+            decoderRemainder !== undefined &&
+            decoderRemainderOffset < decoderRemainder.byteLength
+          ) {
+            const length = Math.min(
+              context.bufferSize,
+              decoderRemainder.byteLength - decoderRemainderOffset,
+            );
+            context.supplyInput(
+              decoderRemainder.subarray(
+                decoderRemainderOffset,
+                decoderRemainderOffset + length,
+              ),
+            );
+            decoderRemainderOffset += length;
+            continue;
+          }
+          decoderRemainder = undefined;
+          decoderRemainderOffset = 0;
           while (currentInput === undefined || inputOffset >= currentInput.byteLength) {
             const result = await reader.read();
             if (result.done) {
@@ -156,8 +273,11 @@ export function decompressXz(
         // the next decoder step when XZ needs more input before producing data.
         controller.enqueue(output.chunk);
         if (output.finished) {
-          await cleanup("XZ stream complete");
-          controller.close();
+          decoderRemainder = context.remainingInput();
+          decoderRemainderOffset = 0;
+          context.dispose();
+          context = undefined;
+          awaitingNextStream = true;
         }
       } catch (error) {
         await cleanup(error, true);

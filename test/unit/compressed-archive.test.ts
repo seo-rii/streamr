@@ -1,6 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { openArchive } from "../../src/archive/open";
 import { listOpenedArchive } from "../../src/archive/select";
+import type { ArchiveEntryHandle, OpenedArchive } from "../../src/archive/types";
 import type { ByteStream } from "../../src/streams/byte-stream";
 
 const TAR_FIXTURES = {
@@ -11,6 +12,8 @@ const TAR_FIXTURES = {
   "tar.zst":
     "KLUv/QRYRQMAYsQOF4DF6QDEwj2zqPgMrLo3LZEluITNxtgBaSikTLMr6JEg3ZTmAliwT+ntgyc8VyDC8P/v8N8ykENNsysNAP5zFcgXIKtjB9TbB8hpkYEKIBxDFQQoIN6QGnDAophpAHQr17YJeAEvBaQ2",
 } as const;
+const ZSTD_PAYLOAD_FIXTURE =
+  "KLUv/WRoALUBANQCVGhlIHF1aWNrIGJyb3duIGZveCBqdW1wcyBvdmVyIHRoZSBsYXp5IGRvZy4KAQDFgaoqA6TB/IU=";
 
 function inputFromBase64(value: string): ByteStream {
   const bytes = Uint8Array.from(atob(value), (character) => character.charCodeAt(0));
@@ -48,4 +51,65 @@ describe("compressed TAR archive resolution", () => {
       });
     });
   }
+
+  it("lists standalone compression as an explicitly unknown-size @payload", async () => {
+    const archive = await openArchive(
+      inputFromBase64(ZSTD_PAYLOAD_FIXTURE),
+      {},
+      { listMode: true },
+    );
+
+    await expect(listOpenedArchive(archive, 10)).resolves.toMatchObject({
+      truncated: false,
+      entries: [{ path: "@payload", type: "file", size: null }],
+    });
+  });
+
+  it("aborts immediately at the listing limit without draining the next entry", async () => {
+    const firstSkip = vi.fn(async () => undefined);
+    const secondSkip = vi.fn(async () => undefined);
+    const abort = vi.fn();
+    const handles: ArchiveEntryHandle[] = [
+      {
+        index: 1,
+        path: "first.txt",
+        occurrence: 1,
+        unsafePath: false,
+        type: "file",
+        async open() {
+          throw new Error("not opened while listing");
+        },
+        skip: firstSkip,
+      },
+      {
+        index: 2,
+        path: "very-large.bin",
+        occurrence: 1,
+        unsafePath: false,
+        type: "file",
+        async open() {
+          throw new Error("not opened while listing");
+        },
+        skip: secondSkip,
+      },
+    ];
+    const archive: OpenedArchive = {
+      format: "test",
+      layers: ["test"],
+      entries: {
+        async *[Symbol.asyncIterator]() {
+          yield* handles;
+        },
+      },
+      abort,
+    };
+
+    await expect(listOpenedArchive(archive, 1)).resolves.toMatchObject({
+      truncated: true,
+      entries: [{ path: "first.txt" }],
+    });
+    expect(firstSkip).toHaveBeenCalledOnce();
+    expect(secondSkip).not.toHaveBeenCalled();
+    expect(abort).toHaveBeenCalledWith("archive listing truncated");
+  });
 });

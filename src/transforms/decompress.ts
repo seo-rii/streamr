@@ -6,6 +6,7 @@ import { decompressZstd } from "../archive/zstd";
 import type { EntryTransformSpec } from "../schemas";
 import type { ByteStream } from "../streams/byte-stream";
 import { peekByteStream } from "../streams/peek";
+import { contentTypeForPath } from "../util/mime";
 import {
   derivedByteStream,
   inputChunks,
@@ -14,6 +15,20 @@ import {
 } from "./stream";
 
 type DecompressFormat = Extract<EntryTransformSpec, { type: "decompress" }>["format"];
+
+function decompressedMetadata(source: ByteStream): {
+  filename?: string;
+  contentType: string;
+} {
+  const filename = source.filename?.replace(/\.(?:gz|gzip|bz2|xz|zst|zstd)$/i, "");
+  return {
+    ...(filename === undefined || filename.length === 0 ? {} : { filename }),
+    contentType:
+      filename === undefined || filename.length === 0
+        ? "application/octet-stream"
+        : contentTypeForPath(filename),
+  };
+}
 
 export async function decompressStream(
   input: ByteStream,
@@ -44,7 +59,7 @@ export async function decompressStream(
           : decompressZstd(source, { maxOutputBytes: LIMITS.entryOutputBytes });
     return {
       ...decompressed,
-      ...(source.filename === undefined ? {} : { filename: source.filename }),
+      ...decompressedMetadata(source),
     };
   }
 
@@ -67,7 +82,7 @@ export async function decompressStream(
       source.abort(reason);
     },
   };
-  const metadata = source.filename === undefined ? {} : { filename: source.filename };
+  const metadata = decompressedMetadata(source);
   return derivedByteStream(source, readDecompressed(decompressedInput, completion), metadata);
 }
 

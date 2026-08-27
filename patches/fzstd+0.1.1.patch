@@ -1,5 +1,5 @@
 diff --git a/node_modules/fzstd/esm/index.mjs b/node_modules/fzstd/esm/index.mjs
-index 5d3c01b..526dc8c 100644
+index 5d3c01b..952e876 100644
 --- a/node_modules/fzstd/esm/index.mjs
 +++ b/node_modules/fzstd/esm/index.mjs
 @@ -48,7 +48,7 @@ export var ZstdErrorCode = {
@@ -11,7 +11,95 @@ index 5d3c01b..526dc8c 100644
      'invalid block type',
      'FSE accuracy too high',
      'match distance too far back',
-@@ -98,7 +98,7 @@ var rzfh = function (dat, w) {
+@@ -70,6 +70,87 @@ var rb = function (d, b, n) {
+     return o;
+ };
+ var b4 = function (d, b) { return (d[b] | (d[b + 1] << 8) | (d[b + 2] << 16) | (d[b + 3] << 24)) >>> 0; };
++var xmsk = 0xFFFFFFFFFFFFFFFFn, xp1 = 11400714785074694791n, xp2 = 14029467366897019727n, xp3 = 1609587929392839161n, xp4 = 9650029242287828579n, xp5 = 2870177450012600261n;
++var xrot = function (v, n) { return ((v << n) | (v >> (64n - n))) & xmsk; };
++var xr64 = function (d, p) {
++    var v = 0n;
++    for (var i = 0; i < 8; ++i)
++        v |= BigInt(d[p + i]) << BigInt(i << 3);
++    return v;
++};
++var xrnd = function (a, v) { return (xrot((a + v * xp2) & xmsk, 31n) * xp1) & xmsk; };
++var XXH64 = /*#__PURE__*/ (function () {
++    function XXH64() {
++        this.n = 0;
++        this.m = new u8(32);
++        this.z = 0;
++        this.v1 = (xp1 + xp2) & xmsk;
++        this.v2 = xp2;
++        this.v3 = 0n;
++        this.v4 = (-xp1) & xmsk;
++    }
++    XXH64.prototype.r = function (d, p) {
++        this.v1 = xrnd(this.v1, xr64(d, p));
++        this.v2 = xrnd(this.v2, xr64(d, p + 8));
++        this.v3 = xrnd(this.v3, xr64(d, p + 16));
++        this.v4 = xrnd(this.v4, xr64(d, p + 24));
++    };
++    XXH64.prototype.update = function (d) {
++        var p = 0;
++        this.n += d.length;
++        if (this.z + d.length < 32) {
++            this.m.set(d, this.z);
++            this.z += d.length;
++            return;
++        }
++        if (this.z) {
++            var f = 32 - this.z;
++            this.m.set(d.subarray(0, f), this.z);
++            this.r(this.m, 0);
++            this.z = 0;
++            p = f;
++        }
++        for (; p + 32 <= d.length; p += 32)
++            this.r(d, p);
++        if (p < d.length) {
++            this.m.set(d.subarray(p), 0);
++            this.z = d.length - p;
++        }
++    };
++    XXH64.prototype.digest = function () {
++        var h;
++        if (this.n >= 32) {
++            h = (xrot(this.v1, 1n) + xrot(this.v2, 7n) + xrot(this.v3, 12n) + xrot(this.v4, 18n)) & xmsk;
++            var vs = [this.v1, this.v2, this.v3, this.v4];
++            for (var j = 0; j < 4; ++j)
++                h = (((h ^ xrnd(0n, vs[j])) * xp1) + xp4) & xmsk;
++        }
++        else
++            h = xp5;
++        h = (h + BigInt(this.n)) & xmsk;
++        var p = 0;
++        for (; p + 8 <= this.z; p += 8) {
++            h ^= xrnd(0n, xr64(this.m, p));
++            h = (xrot(h, 27n) * xp1 + xp4) & xmsk;
++        }
++        if (p + 4 <= this.z) {
++            h ^= BigInt(b4(this.m, p)) * xp1;
++            h = (xrot(h, 23n) * xp2 + xp3) & xmsk;
++            p += 4;
++        }
++        for (; p < this.z; ++p) {
++            h ^= BigInt(this.m[p]) * xp5;
++            h = (xrot(h, 11n) * xp1) & xmsk;
++        }
++        h ^= h >> 33n;
++        h = (h * xp2) & xmsk;
++        h ^= h >> 29n;
++        h = (h * xp3) & xmsk;
++        h ^= h >> 32n;
++        return Number(h & 0xFFFFFFFFn) >>> 0;
++    };
++    return XXH64;
++}());
+ // read Zstandard frame header
+ var rzfh = function (dat, w) {
+     var n3 = dat[0] | (dat[1] << 8) | (dat[2] << 16);
+@@ -98,7 +179,7 @@ var rzfh = function (dat, w) {
              var wb = 1 << (10 + (dat[5] >> 3));
              ws = wb + (wb >> 3) * (dat[5] & 7);
          }
@@ -20,3 +108,54 @@ index 5d3c01b..526dc8c 100644
              err(1);
          var buf = new u8((w == 1 ? (fss || ws) : w ? 0 : ws) + 12);
          buf[0] = 1, buf[4] = 4, buf[8] = 8;
+@@ -112,6 +193,7 @@ var rzfh = function (dat, w) {
+             o: new i32(buf.buffer, 0, 3),
+             u: fss,
+             c: cc,
++            x: cc ? new XXH64() : null,
+             m: Math.min(131072, ws)
+         };
+     }
+@@ -668,6 +750,20 @@ var Decompress = /*#__PURE__*/ (function () {
+      * @param final Whether or not this is the last chunk in the stream
+      */
+     Decompress.prototype.push = function (chunk, final) {
++        if (this.k) {
++            var take = Math.min(chunk.length, 4 - this.k.p);
++            this.k.d.set(chunk.subarray(0, take), this.k.p);
++            this.k.p += take;
++            chunk = chunk.subarray(take);
++            if (this.k.p < 4) {
++                if (final)
++                    err(5);
++                return;
++            }
++            if (b4(this.k.d, 0) != this.k.x.digest())
++                err(0, 'invalid zstd checksum');
++            this.k = null;
++        }
+         if (typeof this.s == 'number') {
+             var sub = Math.min(chunk.length, this.s);
+             chunk = chunk.subarray(sub);
+@@ -733,13 +829,20 @@ var Decompress = /*#__PURE__*/ (function () {
+                     return;
+                 }
+                 else {
++                    if (this.s.x)
++                        this.s.x.update(blk);
+                     this.ondata(blk, false);
+                     cpw(this.s.w, 0, blk.length);
+                     this.s.w.set(blk, this.s.w.length - blk.length);
+                 }
+                 if (this.s.l) {
+                     var rest = chunk.subarray(this.s.b);
+-                    this.s = this.s.c * 4;
++                    if (this.s.c) {
++                        this.k = { x: this.s.x, d: new u8(4), p: 0 };
++                        this.s = undefined;
++                    }
++                    else
++                        this.s = 0;
+                     this.push(rest, final);
+                     return;
+                 }

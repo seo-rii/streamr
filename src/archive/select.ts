@@ -15,7 +15,7 @@ export interface ListedEntry {
   occurrence: number;
   unsafePath: boolean;
   type: ArchiveEntryHandle["type"];
-  size?: number;
+  size?: number | null;
   compressedSize?: number;
   compressionMethod?: string | number;
   contentType?: string;
@@ -36,7 +36,6 @@ export async function listOpenedArchive(
         entries.length >= Math.min(maxEntries, LIMITS.listEntries) ||
         metadataBytes + pathBytes > LIST_METADATA_BUDGET
       ) {
-        await entry.skip();
         truncated = true;
         archive.abort("archive listing truncated");
         break;

@@ -142,6 +142,35 @@ describe("ZSTD decompression", () => {
     ).rejects.toMatchObject({ code: "CORRUPT_ARCHIVE", stage: "decompress" });
   });
 
+  it("verifies the optional frame checksum across one-byte input chunks", async () => {
+    const corrupted = fromBase64(ZSTD_FIXTURE);
+    const checksumOffset = corrupted.byteLength - 1;
+    corrupted[checksumOffset] = corrupted[checksumOffset]! ^ 1;
+
+    await expect(
+      readText(decompressZstd(inputStream(corrupted, { chunkSize: 1 }))),
+    ).rejects.toMatchObject({ code: "CORRUPT_ARCHIVE", stage: "decompress" });
+  });
+
+  it("rejects frames whose advertised decoder window exceeds 32 MiB", async () => {
+    const oversizedWindowHeader = new Uint8Array([
+      0x28, 0xb5, 0x2f, 0xfd,
+      0x00,
+      0x90,
+      0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00,
+    ]);
+
+    await expect(
+      readText(decompressZstd(inputStream(oversizedWindowHeader))),
+    ).rejects.toMatchObject({
+      code: "UNSUPPORTED_COMPRESSION",
+      stage: "decompress",
+      details: { format: "zstd", maxWindowBytes: 32 * 1024 * 1024 },
+    });
+  });
+
   it("checks the output limit synchronously in the decoder callback", async () => {
     const abort = vi.fn();
     const decompressed = decompressZstd(inputStream(fromBase64(ZSTD_FIXTURE), { abort }), {

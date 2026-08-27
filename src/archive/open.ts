@@ -46,6 +46,7 @@ function virtualPayloadEntries(input: ByteStream): ArchiveEntryStream {
         occurrence: 1,
         unsafePath: false,
         type: "file",
+        size: null,
         contentType: "application/octet-stream",
         compressionMethod: "decompressed",
         async open() {
@@ -151,6 +152,7 @@ export async function resolveResource(
     innerPeek = await peekByteStream(decompressed, LIMITS.prefixBytes);
   } catch (error) {
     decompressed.abort(error);
+    if (error instanceof GatewayError) throw error;
     throw new GatewayError("CORRUPT_ARCHIVE", "The compressed stream is corrupt or truncated.", {
       stage: "decompress",
       cause: error,
