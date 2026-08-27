@@ -3,9 +3,11 @@ import { defineConfig } from "vitest/config";
 
 export default defineConfig({
   test: {
-    // Starting several isolated workerd pools can exceed Vitest's 5s default
-    // on shared CI hosts even when each request itself completes immediately.
-    testTimeout: 15_000,
+    // Integration files replace the Worker-global fetch implementation. The
+    // Cloudflare pool can share an isolate across files, so serialize files to
+    // prevent one fixture from consuming another fixture's subrequests.
+    fileParallelism: false,
+    testTimeout: 30_000,
   },
   plugins: [
     cloudflareTest({

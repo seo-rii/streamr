@@ -1,9 +1,14 @@
 import { resolveResource } from "../archive/open";
 import type { SourceSpec } from "../schemas";
-import { fetchSource } from "./fetch";
+import { fetchSource, type FetchedSource } from "./fetch";
 
-export async function probeSource(spec: SourceSpec, signal?: AbortSignal) {
+export async function probeSource(
+  spec: SourceSpec,
+  signal?: AbortSignal,
+  onSource?: (source: FetchedSource) => void,
+) {
   const source = await fetchSource(spec, signal);
+  onSource?.(source);
   const resolved = await resolveResource(source.byteStream, {
     url: source.finalUrl,
     ...(source.contentType === undefined ? {} : { contentType: source.contentType }),
