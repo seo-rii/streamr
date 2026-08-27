@@ -14,18 +14,24 @@ export async function peekByteStream(
   let prefixLength = 0;
   let remainder: Uint8Array | undefined;
 
-  while (prefixLength < maxBytes) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    const needed = maxBytes - prefixLength;
-    if (value.byteLength <= needed) {
-      prefixChunks.push(value);
-      prefixLength += value.byteLength;
-    } else {
-      prefixChunks.push(value.subarray(0, needed));
-      prefixLength += needed;
-      remainder = value.subarray(needed);
+  try {
+    while (prefixLength < maxBytes) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const needed = maxBytes - prefixLength;
+      if (value.byteLength <= needed) {
+        prefixChunks.push(value);
+        prefixLength += value.byteLength;
+      } else {
+        prefixChunks.push(value.subarray(0, needed));
+        prefixLength += needed;
+        remainder = value.subarray(needed);
+      }
     }
+  } catch (error) {
+    input.abort(error);
+    reader.releaseLock();
+    throw error;
   }
 
   const prefix = new Uint8Array(prefixLength);
@@ -71,4 +77,3 @@ export async function peekByteStream(
     },
   };
 }
-

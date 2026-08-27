@@ -1,8 +1,10 @@
+import { LIMITS } from "../constants";
 import { GatewayError, asGatewayError, type SerializedGatewayError } from "../errors";
 import type { DistributionRoute } from "../schemas";
 import { createDrainShield, type DrainShield } from "../streams/drain-shield";
 import { applyEntryTransforms, limitEntryBytes, validateEntryTransforms } from "../transforms";
 import { normalizeArchivePath } from "../util/path";
+import { inferByteStreamContentType } from "../util/mime";
 import type { OpenedArchive } from "../archive/types";
 import {
   uploadByteStream,
@@ -66,6 +68,7 @@ export interface DistributionResult {
   warnings: DistributionWarning[];
   errors: SerializedGatewayError[];
   sourceGets?: number;
+  bytesWritten: number;
 }
 
 interface PreparedRoute {
@@ -192,6 +195,7 @@ export async function distributeArchive(
   failurePolicy: FailurePolicy = "abort",
   signal?: AbortSignal,
   sourceGets?: number,
+  requestOutputLimit: number = LIMITS.requestOutputBytes,
 ): Promise<DistributionResult> {
   const preparedRoutes = prepareRoutes(routes);
   const routesByKey = new Map(preparedRoutes.map((prepared) => [prepared.key, prepared]));
@@ -202,6 +206,7 @@ export async function distributeArchive(
   let entriesScanned = 0;
   let stoppedEarly = false;
   let responseCaptureRemaining = TARGET_RESPONSE_CAPTURE_BUDGET;
+  let requestBytesWritten = 0;
   let remainingRoutesNotRun = false;
 
   const abortForSignal = () => archive.abort(signal?.reason ?? "distribution aborted");
@@ -245,6 +250,50 @@ export async function distributeArchive(
             { allowMultipartFormData: true },
           );
           transformed = limitEntryBytes(transformed);
+          transformed = await inferByteStreamContentType(transformed);
+          const aggregateInput = transformed;
+          const remainingRequestBytes = requestOutputLimit - requestBytesWritten;
+          if (
+            aggregateInput.knownLength !== undefined &&
+            aggregateInput.knownLength > remainingRequestBytes
+          ) {
+            aggregateInput.abort("request output limit exceeded");
+            throw new GatewayError(
+              "OUTPUT_LIMIT_EXCEEDED",
+              "The distribution request exceeded its total output limit.",
+              {
+                stage: "request-limit",
+                details: {
+                  maxBytes: requestOutputLimit,
+                  observedBytes: requestBytesWritten + aggregateInput.knownLength,
+                },
+              },
+            );
+          }
+          transformed = {
+            ...aggregateInput,
+            stream: aggregateInput.stream.pipeThrough(
+              new TransformStream<Uint8Array, Uint8Array>({
+                transform(chunk, controller) {
+                  if (requestBytesWritten + chunk.byteLength > requestOutputLimit) {
+                    throw new GatewayError(
+                      "OUTPUT_LIMIT_EXCEEDED",
+                      "The distribution request exceeded its total output limit.",
+                      {
+                        stage: "request-limit",
+                        details: {
+                          maxBytes: requestOutputLimit,
+                          observedBytes: requestBytesWritten + chunk.byteLength,
+                        },
+                      },
+                    );
+                  }
+                  requestBytesWritten += chunk.byteLength;
+                  controller.enqueue(chunk);
+                },
+              }),
+            ),
+          };
           const upload = await uploadByteStream(
             transformed,
             {
@@ -279,6 +328,21 @@ export async function distributeArchive(
             error: serialized,
           });
           if (!prepared.route.required) warnings.push(warningFor(prepared, serialized));
+
+          if (
+            serialized.code === "INTERNAL_ERROR" ||
+            serialized.code === "PIPELINE_ABORTED" ||
+            serialized.stage === "request-limit" ||
+            serialized.stage === "archive-read" ||
+            serialized.stage === "source-read" ||
+            serialized.stage === "source-fetch"
+          ) {
+            errors.push(serialized);
+            remainingRoutesNotRun = true;
+            stoppedEarly = true;
+            archive.abort(error);
+            break;
+          }
 
           if (failurePolicy === "abort") {
             remainingRoutesNotRun = true;
@@ -337,6 +401,7 @@ export async function distributeArchive(
       results,
       warnings,
       errors,
+      bytesWritten: requestBytesWritten,
       ...(sourceGets === undefined ? {} : { sourceGets }),
     };
   } finally {

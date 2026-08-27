@@ -359,4 +359,41 @@ describe("target streaming edges", () => {
     ]);
     expect(result.errors).toHaveLength(1);
   });
+
+  it("enforces one aggregate output limit across distribution routes", async () => {
+    const fixture = instrumentedArchive([
+      { path: "first.bin", chunks: 2 },
+      { path: "second.bin", chunks: 2 },
+      { path: "third.bin", chunks: 1 },
+    ]);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+        const body = init?.body as ReadableStream<Uint8Array> | undefined;
+        if (body === undefined) throw new Error("missing target request body");
+        await consume(body);
+        return new Response(null, { status: 201 });
+      }),
+    );
+
+    const result = await distributeArchive(
+      fixture.archive,
+      [route("first.bin"), route("second.bin"), route("third.bin")],
+      "continue",
+      undefined,
+      undefined,
+      3,
+    );
+
+    expect(result.results.map(({ status }) => status)).toEqual([
+      "uploaded",
+      "failed",
+      "not-run",
+    ]);
+    expect(result.results[1]).toMatchObject({
+      error: { code: "OUTPUT_LIMIT_EXCEEDED", stage: "request-limit" },
+    });
+    expect(result.errors).toHaveLength(1);
+    expect(fixture.yielded()).toBe(2);
+  });
 });

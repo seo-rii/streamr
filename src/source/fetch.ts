@@ -5,6 +5,7 @@ import { createTimedAbort } from "../streams/abort";
 import type { ByteStream } from "../streams/byte-stream";
 import { wrapCancellableStream } from "../streams/byte-stream";
 import { parseContentLength, validatedHeaders } from "../util/headers";
+import { contentTypeForPath } from "../util/mime";
 
 const REDIRECT_STATUS = new Set([301, 302, 303, 307, 308]);
 const FORBIDDEN_SOURCE_HEADERS = new Set([
@@ -154,7 +155,14 @@ export async function fetchSource(
   }
 
   const contentLength = parseContentLength(response.headers.get("Content-Length"));
-  const contentType = response.headers.get("Content-Type") ?? undefined;
+  const contentType = response.headers.get("Content-Type") ?? contentTypeForPath(url.pathname);
+  const encodedFilename = url.pathname.split("/").at(-1) ?? "";
+  let filename = encodedFilename;
+  try {
+    filename = decodeURIComponent(encodedFilename);
+  } catch {
+    // Keep the encoded path segment when the upstream URL has invalid escapes.
+  }
   const abort = (reason?: unknown) => {
     timedAbort.clear();
     if (!timedAbort.controller.signal.aborted) timedAbort.controller.abort(reason);
@@ -169,9 +177,36 @@ export async function fetchSource(
   );
 
   const byteStream: ByteStream = {
-    stream: wrapCancellableStream(countedStream, abort, timedAbort.clear),
+    stream: wrapCancellableStream(
+      countedStream,
+      abort,
+      timedAbort.clear,
+      (error) => {
+        if (error instanceof GatewayError) return error;
+        if (timedAbort.timedOut()) {
+          return new GatewayError("SOURCE_TIMEOUT", "The source request timed out.", {
+            stage: "source-read",
+            retryable: true,
+            cause: error,
+          });
+        }
+        if (parentSignal?.aborted === true) {
+          return new GatewayError("PIPELINE_ABORTED", "The pipeline was aborted.", {
+            stage: "source-read",
+            retryable: true,
+            cause: error,
+          });
+        }
+        return new GatewayError("SOURCE_FETCH_FAILED", "The source body could not be read.", {
+          stage: "source-read",
+          retryable: true,
+          cause: error,
+        });
+      },
+    ),
     ...(contentLength === undefined ? {} : { knownLength: contentLength }),
     ...(contentType === undefined ? {} : { contentType }),
+    ...(filename.length === 0 ? {} : { filename }),
     abort,
   };
 

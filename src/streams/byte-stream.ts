@@ -10,8 +10,15 @@ export function wrapCancellableStream(
   stream: ReadableStream<Uint8Array>,
   abort: (reason?: unknown) => void,
   onDone?: () => void,
+  mapError?: (error: unknown) => unknown,
 ): ReadableStream<Uint8Array> {
   const reader = stream.getReader();
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    reader.releaseLock();
+  };
 
   return new ReadableStream<Uint8Array>({
     async pull(controller) {
@@ -19,21 +26,27 @@ export function wrapCancellableStream(
         const result = await reader.read();
         if (result.done) {
           onDone?.();
+          release();
           controller.close();
           return;
         }
         controller.enqueue(result.value);
       } catch (error) {
+        const mappedError = mapError?.(error) ?? error;
         onDone?.();
-        abort(error);
-        controller.error(error);
+        release();
+        abort(mappedError);
+        controller.error(mappedError);
       }
     },
     async cancel(reason) {
       onDone?.();
       abort(reason);
-      await reader.cancel(reason);
+      try {
+        await reader.cancel(reason);
+      } finally {
+        release();
+      }
     },
   });
 }
-

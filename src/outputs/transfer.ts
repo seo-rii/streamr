@@ -143,6 +143,7 @@ export async function uploadByteStream(
 
   const timedAbort = createTimedAbort(target.timeoutMs, parentSignal);
   let bytesWritten = 0;
+  let sourceFailure: unknown;
   const sourceReader = byteStream.stream.getReader();
   let sourceReaderReleased = false;
   let uploadSettled = false;
@@ -193,6 +194,7 @@ export async function uploadByteStream(
           bytesWritten += result.value.byteLength;
           controller.enqueue(result.value);
         } catch (error) {
+          sourceFailure = error;
           failUpload(error);
           releaseSourceReader();
           controller.error(error);
@@ -244,6 +246,7 @@ export async function uploadByteStream(
         cause: error,
       });
     }
+    if (sourceFailure instanceof GatewayError) throw sourceFailure;
     throw new GatewayError("TARGET_FETCH_FAILED", "The target request failed.", {
       stage: "target-fetch",
       retryable: true,
@@ -279,6 +282,7 @@ export async function uploadByteStream(
           cause: error,
         });
       }
+      if (error instanceof GatewayError) throw error;
       throw new GatewayError("TARGET_BODY_REJECTED", "The target rejected the request body.", {
         stage: "target-upload",
         retryable: true,

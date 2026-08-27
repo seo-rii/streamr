@@ -15,6 +15,7 @@ export function createDrainShield(input: ByteStream): DrainShield {
   const reader = input.stream.getReader();
   let done = false;
   let released = false;
+  let terminalError: unknown;
   let drainRequested = false;
   let activeRead: Promise<ReadableStreamReadResult<Uint8Array>> | undefined;
   let drainPromise: Promise<void> | undefined;
@@ -37,6 +38,7 @@ export function createDrainShield(input: ByteStream): DrainShield {
         },
         (error: unknown) => {
           done = true;
+          terminalError = error;
           release();
           throw error;
         },
@@ -50,10 +52,12 @@ export function createDrainShield(input: ByteStream): DrainShield {
     drainRequested = true;
     drainPromise ??= (async () => {
       try {
+        if (terminalError !== undefined) throw terminalError;
         while (!done) {
           const result = await read();
           if (result.done) done = true;
         }
+        if (terminalError !== undefined) throw terminalError;
       } finally {
         if (done) release();
       }

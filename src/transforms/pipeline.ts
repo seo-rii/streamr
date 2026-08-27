@@ -75,6 +75,15 @@ export function validateFinalTransforms(transforms: readonly FinalTransformSpec[
   }
 }
 
+export function validateCombinedTransforms(
+  entryTransforms: readonly EntryTransformSpec[],
+  finalTransforms: readonly FinalTransformSpec[],
+): void {
+  if (entryTransforms.length + finalTransforms.length > LIMITS.transforms) {
+    invalid(`At most ${LIMITS.transforms} common transforms are allowed.`);
+  }
+}
+
 export async function applyEntryTransforms(
   input: ByteStream,
   transforms: readonly EntryTransformSpec[],

@@ -15,16 +15,14 @@ export function rawResponse(
   },
 ): Response {
   const headers = new Headers({ "Cache-Control": "no-store" });
-  const contentType = output.contentType ?? byteStream.contentType;
-  if (contentType !== undefined) {
-    if (/[\r\n]/.test(contentType)) {
-      byteStream.abort("invalid content type");
-      throw new GatewayError("INVALID_CONTENT_TYPE", "The output content type is invalid.", {
-        stage: "output-validate",
-      });
-    }
-    headers.set("Content-Type", contentType);
+  const contentType = output.contentType ?? byteStream.contentType ?? "application/octet-stream";
+  if (/[\r\n]/.test(contentType)) {
+    byteStream.abort("invalid content type");
+    throw new GatewayError("INVALID_CONTENT_TYPE", "The output content type is invalid.", {
+      stage: "output-validate",
+    });
   }
+  headers.set("Content-Type", contentType);
   const filename = output.filename ?? byteStream.filename;
   if (filename !== undefined) {
     if (/[\r\n]/.test(filename)) {
@@ -40,6 +38,13 @@ export function rawResponse(
   }
   if (byteStream.knownLength !== undefined) {
     headers.set("Content-Length", String(byteStream.knownLength));
+    const fixed = new FixedLengthStream(byteStream.knownLength);
+    const pump = byteStream.stream.pipeTo(fixed.writable).catch((error: unknown) => {
+      byteStream.abort(error);
+      throw error;
+    });
+    void pump.catch(() => undefined);
+    return new Response(fixed.readable, { status: 200, headers });
   }
 
   return new Response(byteStream.stream, { status: 200, headers });

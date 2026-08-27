@@ -8,11 +8,13 @@ import {
   applyFinalTransforms,
   limitEntryBytes,
   limitBytes,
+  validateCombinedTransforms,
   validateEntryTransforms,
   validateFinalTransforms,
 } from "../transforms";
 import { inputChunks } from "../transforms/stream";
 import { normalizeArchivePath } from "../util/path";
+import { inferByteStreamContentType } from "../util/mime";
 import type { ArchiveEntryHandle, OpenedArchive } from "../archive/types";
 
 const encoder = new TextEncoder();
@@ -48,6 +50,10 @@ export interface MultipartMixedStreamResult {
   boundary: string;
 }
 
+export interface MultipartMixedStats {
+  entriesScanned: number;
+}
+
 /**
  * Encodes selected archive entries as one bounded-memory multipart/mixed stream.
  * Entry bodies are opened and completely consumed in archive order, one at a time.
@@ -58,10 +64,12 @@ export async function createMultipartMixedStream(
   entryTransforms: readonly EntryTransformSpec[] = [],
   finalTransforms: readonly FinalTransformSpec[] = [],
   signal?: AbortSignal,
+  onManifest?: (manifest: MultipartMixedManifest, stats: MultipartMixedStats) => void,
 ): Promise<MultipartMixedStreamResult> {
   const normalizedSelectors = normalizeSelectors(selectors);
   validateEntryTransforms(entryTransforms, { allowMultipartFormData: false });
   validateFinalTransforms(finalTransforms);
+  validateCombinedTransforms(entryTransforms, finalTransforms);
 
   if (signal?.aborted === true) {
     archive.abort(signal.reason);
@@ -72,7 +80,13 @@ export async function createMultipartMixedStream(
   }
 
   const boundary = `sgw_${crypto.randomUUID().replaceAll("-", "")}`;
-  const iterator = encodeMultipartArchive(archive, normalizedSelectors, entryTransforms, boundary);
+  const iterator = encodeMultipartArchive(
+    archive,
+    normalizedSelectors,
+    entryTransforms,
+    boundary,
+    onManifest,
+  );
   const base = iteratorByteStream(iterator, archive, signal, {
     contentType: `multipart/mixed; boundary=${boundary}`,
   });
@@ -132,6 +146,7 @@ async function* encodeMultipartArchive(
   selectors: NormalizedSelector[],
   transforms: readonly EntryTransformSpec[],
   boundary: string,
+  onManifest?: (manifest: MultipartMixedManifest, stats: MultipartMixedStats) => void,
 ): AsyncGenerator<Uint8Array> {
   const selected = new Map(
     selectors.map((selector) => [selectorKey(selector.path, selector.occurrence), selector]),
@@ -139,6 +154,7 @@ async function* encodeMultipartArchive(
   const errors: MultipartManifestError[] = [];
   const errorKeys = new Set<string>();
   let emitted = 0;
+  let entriesScanned = 0;
   let unresolved = selectors.length;
   let archiveCompleted = false;
   let archiveFailed = false;
@@ -161,6 +177,7 @@ async function* encodeMultipartArchive(
       }
 
       const entry = result.value;
+      entriesScanned += 1;
       const selector = selected.get(selectorKey(entry.path, entry.occurrence));
       if (selector === undefined) {
         try {
@@ -212,6 +229,7 @@ async function* encodeMultipartArchive(
           allowMultipartFormData: false,
         });
         transformed = limitEntryBytes(transformed);
+        transformed = await inferByteStreamContentType(transformed);
 
         yield encodePartHeaders(boundary, entry, transformed);
         partStarted = true;
@@ -267,6 +285,7 @@ async function* encodeMultipartArchive(
       missing,
       errors,
     };
+    onManifest?.(manifest, { entriesScanned });
     yield encodeManifest(boundary, manifest);
   } finally {
     if (!archiveCompleted) {

@@ -7,6 +7,7 @@ export { normalizeNewlines } from "./newline";
 export {
   applyEntryTransforms,
   applyFinalTransforms,
+  validateCombinedTransforms,
   validateEntryTransforms,
   validateFinalTransforms,
 } from "./pipeline";
