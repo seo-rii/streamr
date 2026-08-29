@@ -3,6 +3,15 @@
 // Runtime types generated with workerd@1.20260825.1 2026-08-27 enable_request_signal,nodejs_compat,request_signal_passthrough
 interface __BaseEnv_Env {
 	MCP_API_TOKEN: string;
+	MCP_AUTH_MODE?: string;
+	MCP_OAUTH_RESOURCE?: string;
+	MCP_OAUTH_SIGNING_SECRET?: string;
+	MCP_OAUTH_LOGIN_USERNAME?: string;
+	MCP_OAUTH_LOGIN_PASSWORD?: string;
+	MCP_OAUTH_ALLOWED_REDIRECT_URIS?: string;
+	MCP_OAUTH_READ_SCOPES?: string;
+	MCP_OAUTH_WRITE_SCOPES?: string;
+	MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS?: string;
 	URL_SIGNING_SECRET: string;
 }
 declare namespace Cloudflare {
@@ -16,7 +25,7 @@ type StringifyValues<EnvType extends Record<string, unknown>> = {
 	[Binding in keyof EnvType]: EnvType[Binding] extends string ? EnvType[Binding] : string;
 };
 declare namespace NodeJS {
-	interface ProcessEnv extends StringifyValues<Pick<Cloudflare.Env, "MCP_API_TOKEN" | "URL_SIGNING_SECRET">> {}
+	interface ProcessEnv extends StringifyValues<Pick<Cloudflare.Env, "MCP_API_TOKEN" | "MCP_AUTH_MODE" | "MCP_OAUTH_RESOURCE" | "MCP_OAUTH_SIGNING_SECRET" | "MCP_OAUTH_LOGIN_USERNAME" | "MCP_OAUTH_LOGIN_PASSWORD" | "MCP_OAUTH_ALLOWED_REDIRECT_URIS" | "MCP_OAUTH_READ_SCOPES" | "MCP_OAUTH_WRITE_SCOPES" | "MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS" | "URL_SIGNING_SECRET">> {}
 }
 
 // Begin runtime types

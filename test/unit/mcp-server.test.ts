@@ -136,6 +136,102 @@ describe("stateless MCP server", () => {
     }
   });
 
+  it("advertises OAuth schemes and returns a scope challenge before an operation", async () => {
+    const operations = gatewayOperations();
+    const resourceMetadataUrl =
+      "https://gateway.test/.well-known/oauth-protected-resource/mcp";
+    const handler = createGatewayMcpHandler(operations, {
+      mode: "oauth",
+      readScopes: ["streamr.read"],
+      writeScopes: ["streamr.write"],
+      resourceMetadataUrl,
+    });
+    const wireMessages: Array<Record<string, unknown>> = [];
+    const transport = new StreamableHTTPClientTransport(
+      new URL("https://gateway.test/mcp"),
+      {
+        fetch: async (input, init) => {
+          const request =
+            input instanceof Request && init === undefined
+              ? input
+              : new Request(input, init);
+          const response = await handler.fetch(request, {
+            authInfo: {
+              token: "test-token",
+              clientId: "test-client",
+              scopes: ["streamr.read"],
+              expiresAt: Math.floor(Date.now() / 1000) + 60,
+            },
+          });
+          const wireBody = await response.clone().text();
+          for (const line of wireBody.split("\n")) {
+            const encoded = line.startsWith("data: ") ? line.slice(6) : line;
+            if (!encoded.startsWith("{")) continue;
+            wireMessages.push(JSON.parse(encoded) as Record<string, unknown>);
+          }
+          return response;
+        },
+      },
+    );
+    const client = new Client({ name: "oauth-test-client", version: "1.0.0" });
+
+    await client.connect(transport);
+    try {
+      const { tools } = await client.listTools();
+      expect(tools.find((tool) => tool.name === "probe_url")).toMatchObject({
+        _meta: {
+          securitySchemes: [{ type: "oauth2", scopes: ["streamr.read"] }],
+        },
+      });
+      const toolsWireResult = wireMessages.find((message) => {
+        const result = message.result;
+        return (
+          typeof result === "object" &&
+          result !== null &&
+          Array.isArray((result as { tools?: unknown }).tools)
+        );
+      });
+      expect(toolsWireResult).toMatchObject({
+        result: {
+          tools: expect.arrayContaining([
+            expect.objectContaining({
+              name: "probe_url",
+              securitySchemes: [
+                { type: "oauth2", scopes: ["streamr.read"] },
+              ],
+            }),
+            expect.objectContaining({
+              name: "transfer",
+              securitySchemes: [
+                { type: "oauth2", scopes: ["streamr.write"] },
+              ],
+            }),
+          ]),
+        },
+      });
+
+      const result = await client.callTool({
+        name: "transfer",
+        arguments: {
+          source: { url: "https://source.test/data" },
+          target: { url: "https://target.test/data", method: "PUT" },
+        },
+      });
+      expect(result.isError).toBe(true);
+      expect(result._meta).toEqual({
+        "mcp/www_authenticate": [
+          `Bearer error="insufficient_scope", ` +
+            `error_description="The bearer token does not grant the required scope.", ` +
+            `scope="streamr.read streamr.write", ` +
+            `resource_metadata="${resourceMetadataUrl}"`,
+        ],
+      });
+      expect(operations.transfer).not.toHaveBeenCalled();
+    } finally {
+      await client.close();
+    }
+  });
+
   it("rejects JSON-RPC batches before any gateway operation starts", async () => {
     const operations = gatewayOperations();
     const handler = createGatewayMcpHandler(operations);

@@ -1,0 +1,84 @@
+diff --git a/node_modules/@modelcontextprotocol/server/dist/createMcpHandler-CLhGwQTn.d.mts b/node_modules/@modelcontextprotocol/server/dist/createMcpHandler-CLhGwQTn.d.mts
+index 0f86d3f..d22b76b 100644
+--- a/node_modules/@modelcontextprotocol/server/dist/createMcpHandler-CLhGwQTn.d.mts
++++ b/node_modules/@modelcontextprotocol/server/dist/createMcpHandler-CLhGwQTn.d.mts
+@@ -3302,6 +3302,7 @@ declare class McpServer {
+     description?: string;
+     inputSchema?: InputArgs;
+     outputSchema?: OutputArgs;
++    securitySchemes?: Array<Record<string, unknown>>;
+     annotations?: ToolAnnotations;
+     icons?: Icon[];
+     _meta?: Record<string, unknown>;
+@@ -3312,6 +3313,7 @@ declare class McpServer {
+     description?: string;
+     inputSchema?: InputArgs;
+     outputSchema?: OutputArgs;
++    securitySchemes?: Array<Record<string, unknown>>;
+     annotations?: ToolAnnotations;
+     icons?: Icon[];
+     _meta?: Record<string, unknown>;
+@@ -3472,6 +3474,7 @@ type RegisteredTool = {
+    * no `outputSchema` is registered or its conversion threw (see {@link convertOutputSchemaJson}).
+    */
+   outputSchemaJson?: Record<string, unknown>;
++  securitySchemes?: Array<Record<string, unknown>>;
+   annotations?: ToolAnnotations;
+   icons?: Icon[];
+   execution?: ToolExecution;
+@@ -3488,6 +3491,7 @@ type RegisteredTool = {
+     description?: string;
+     paramsSchema?: StandardSchemaWithJSON;
+     outputSchema?: StandardSchemaWithJSON;
++    securitySchemes?: Array<Record<string, unknown>>;
+     annotations?: ToolAnnotations;
+     icons?: Icon[];
+     _meta?: Record<string, unknown>;
+diff --git a/node_modules/@modelcontextprotocol/server/dist/mcp-DXXb3Vv3.mjs b/node_modules/@modelcontextprotocol/server/dist/mcp-DXXb3Vv3.mjs
+index 49d5128..c71bfc4 100644
+--- a/node_modules/@modelcontextprotocol/server/dist/mcp-DXXb3Vv3.mjs
++++ b/node_modules/@modelcontextprotocol/server/dist/mcp-DXXb3Vv3.mjs
+@@ -1383,6 +1383,7 @@ var McpServer = class {
+ 				title: tool.title,
+ 				description: tool.description,
+ 				inputSchema: tool.inputSchema ? standardSchemaToJsonSchema(tool.inputSchema, "input") : EMPTY_OBJECT_JSON_SCHEMA,
++				securitySchemes: tool.securitySchemes,
+ 				annotations: tool.annotations,
+ 				icons: tool.icons,
+ 				execution: tool.execution,
+@@ -1694,7 +1695,7 @@ var McpServer = class {
+ 		}
+ 		return registeredPrompt;
+ 	}
+-	_createRegisteredTool(name, title, description, inputSchema, outputSchema, annotations, icons, execution, _meta, handler) {
++	_createRegisteredTool(name, title, description, inputSchema, outputSchema, securitySchemes, annotations, icons, execution, _meta, handler) {
+ 		validateAndWarnToolName(name);
+ 		if (inputSchema !== void 0) try {
+ 			const json = standardSchemaToJsonSchema(inputSchema, "input");
+@@ -1709,6 +1710,7 @@ var McpServer = class {
+ 			inputSchema,
+ 			outputSchema,
+ 			outputSchemaJson: convertOutputSchemaJson(outputSchema),
++			securitySchemes,
+ 			annotations,
+ 			icons,
+ 			execution,
+@@ -1749,6 +1751,7 @@ var McpServer = class {
+ 					registeredTool.outputSchemaJson = convertOutputSchemaJson(updates.outputSchema);
+ 				}
+ 				if (updates.annotations !== void 0) registeredTool.annotations = updates.annotations;
++				if (updates.securitySchemes !== void 0) registeredTool.securitySchemes = updates.securitySchemes;
+ 				if (updates.icons !== void 0) registeredTool.icons = updates.icons;
+ 				if (updates._meta !== void 0) registeredTool._meta = updates._meta;
+ 				if (updates.enabled !== void 0) registeredTool.enabled = updates.enabled;
+@@ -1762,8 +1765,8 @@ var McpServer = class {
+ 	}
+ 	registerTool(name, config, cb) {
+ 		if (this._registeredTools[name]) throw new Error(`Tool ${name} is already registered`);
+-		const { title, description, inputSchema, outputSchema, annotations, icons, _meta } = config;
+-		return this._createRegisteredTool(name, title, description, normalizeRawShapeSchema(inputSchema), normalizeRawShapeSchema(outputSchema), annotations, icons, void 0, _meta, cb);
++		const { title, description, inputSchema, outputSchema, securitySchemes, annotations, icons, _meta } = config;
++		return this._createRegisteredTool(name, title, description, normalizeRawShapeSchema(inputSchema), normalizeRawShapeSchema(outputSchema), securitySchemes, annotations, icons, void 0, _meta, cb);
+ 	}
+ 	registerPrompt(name, config, cb) {
+ 		if (this._registeredPrompts[name]) throw new Error(`Prompt ${name} is already registered`);

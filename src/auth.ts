@@ -5,6 +5,20 @@ async function digest(value: string): Promise<ArrayBuffer> {
   return crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
 }
 
+export async function secureStringEqual(
+  provided: string,
+  expected: string,
+): Promise<boolean> {
+  const [providedHash, expectedHash] = await Promise.all([
+    digest(provided),
+    digest(expected),
+  ]);
+  return timingSafeEqual(
+    new Uint8Array(providedHash),
+    new Uint8Array(expectedHash),
+  );
+}
+
 export async function requireBearer(request: Request, expected: string): Promise<void> {
   const authorization = request.headers.get("Authorization");
   if (authorization === null) {
@@ -20,11 +34,7 @@ export async function requireBearer(request: Request, expected: string): Promise
     });
   }
 
-  const [providedHash, expectedHash] = await Promise.all([
-    digest(match[1]),
-    digest(expected),
-  ]);
-  if (!timingSafeEqual(new Uint8Array(providedHash), new Uint8Array(expectedHash))) {
+  if (!(await secureStringEqual(match[1], expected))) {
     throw new GatewayError("AUTH_INVALID", "Bearer authentication is invalid.", {
       stage: "auth",
     });

@@ -23,6 +23,7 @@
     "agents": "0.21.0",
     "fflate": "0.8.3",
     "fzstd": "0.1.1",
+    "jose": "6.2.10",
     "modern-tar": "0.8.4",
     "xz-decompress": "0.2.3",
     "zod": "4.4.3"

@@ -8,18 +8,25 @@ import {
 } from "agents/mcp/server";
 import { GatewayError } from "../errors";
 import { readJsonRequest } from "../util/json";
-import { registerGatewayTools, type GatewayOperations } from "./tools";
+import {
+  registerGatewayTools,
+  type GatewayOperations,
+  type GatewayToolAuthPolicy,
+} from "./tools";
 
 export type GatewayOperationsProvider = (
   request: Request | undefined,
 ) => GatewayOperations;
 
-export function createServer(operations: GatewayOperations): McpServer {
+export function createServer(
+  operations: GatewayOperations,
+  authPolicy: GatewayToolAuthPolicy = { mode: "token" },
+): McpServer {
   const server = new McpServer({
     name: "stateless-stream-gateway",
     version: "0.2.0",
   });
-  registerGatewayTools(server, operations);
+  registerGatewayTools(server, operations, authPolicy);
   return server;
 }
 
@@ -32,6 +39,7 @@ export function createServer(operations: GatewayOperations): McpServer {
  */
 export function createGatewayMcpHandler(
   operations: GatewayOperations | GatewayOperationsProvider,
+  authPolicy: GatewayToolAuthPolicy = { mode: "token" },
 ): StatelessMcpHandler {
   const sdkHandler = createMcpHandler(
     (context) =>
@@ -39,6 +47,7 @@ export function createGatewayMcpHandler(
         typeof operations === "function"
           ? operations(context.requestInfo)
           : operations,
+        authPolicy,
       ),
     {
       route: "/mcp",
