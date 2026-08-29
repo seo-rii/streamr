@@ -1,6 +1,6 @@
 # streamr
 
-`streamr` is a private, stateless, bounded-memory HTTP stream gateway and MCP server for Cloudflare Workers. Version 0.2 downloads one HTTP/HTTPS source per operation, optionally scans an archive in source order, applies predefined streaming transforms, and either streams the result to the caller or uploads selected entries to HTTP targets.
+`streamr` is an open-source, stateless, bounded-memory HTTP stream gateway and MCP server for Cloudflare Workers. Version 0.2 downloads one HTTP/HTTPS source per operation, optionally scans an archive in source order, applies predefined streaming transforms, and either streams the result to the caller or uploads selected entries to HTTP targets.
 
 The Worker has no R2, KV, D1, Durable Objects, Queues, Containers, cache, jobs, or cross-request session state. Every `probe`, `list`, `stream`, `transfer`, or `distribute` request starts a new source download and discards all request state when it ends.
 
@@ -18,20 +18,57 @@ This is deliberately an SSRF-capable personal gateway: there is no hostname allo
 
 | Method | Path | Authentication | Purpose |
 | --- | --- | --- | --- |
-| `POST` | `/mcp` | Bearer token | Stateless MCP Streamable HTTP endpoint |
+| `POST` | `/mcp` | Configurable Bearer token or OAuth authorization code + PKCE | Stateless MCP Streamable HTTP endpoint |
 | `POST` | `/v1/probe` | Bearer token | Fetch a bounded prefix and detect the source format |
 | `POST` | `/v1/list` | Bearer token | List archive entries in archive order |
 | `POST` | `/v1/stream` | Bearer token | Stream a raw source, one entry, or `multipart/mixed` |
 | `GET` | `/v1/stream?p=...&e=...&s=...` | HMAC capability URL | Run a small public-source stream pipeline |
 | `POST` | `/v1/transfer` | Bearer token | Send one source or one entry to one target |
 | `POST` | `/v1/distribute` | Bearer token | Send archive entries sequentially to independent targets |
+| `GET` | `/.well-known/oauth-protected-resource` | None | OAuth protected-resource metadata in OAuth mode |
+| `GET` | `/.well-known/oauth-protected-resource/mcp` | None | Path-derived alias for OAuth metadata in OAuth mode |
+| `GET` | `/.well-known/oauth-authorization-server` | None | Built-in authorization-server metadata in OAuth mode |
+| `POST` | `/register` | None | Stateless dynamic OAuth client registration in OAuth mode |
+| `GET`, `POST` | `/authorize` | Owner login | Authorization and consent with PKCE in OAuth mode |
+| `POST` | `/token` | OAuth grant | Authorization-code exchange in OAuth mode |
 | `GET` | `/healthz` | None | Liveness and version check |
 
-All authenticated HTTP requests use:
+`/v1/*` authentication always uses the static API token:
 
 ```http
 Authorization: Bearer <MCP_API_TOKEN>
 ```
+
+The MCP endpoint has two explicit authentication modes selected by `MCP_AUTH_MODE`:
+
+- `token` is the default and compares the Bearer credential with `MCP_API_TOKEN`. It is suitable for MCP clients that can set a private custom header.
+- `oauth` enables the Worker's built-in, single-owner authorization server. It publishes protected-resource and authorization-server metadata, performs dynamic client registration, requires authorization-code flow with PKCE S256, issues purpose-separated encrypted tokens, and advertises and enforces `streamr.read` or `streamr.write` per tool.
+
+There is intentionally no unauthenticated mode. Streamr can fetch arbitrary public URLs and send bytes to arbitrary HTTP targets, so exposing its tools anonymously would create an unsafe public relay. Changing `MCP_AUTH_MODE` affects only `/mcp`; the REST control routes continue to require `MCP_API_TOKEN`, and signed `GET /v1/stream` URLs continue to use `URL_SIGNING_SECRET`.
+
+OAuth mode does not require an external identity provider. The same Worker exposes `/register`, `/authorize`, and `/token`; the owner credentials and token-encryption secret come only from Worker environment variables. Dynamic registrations, authorization requests, codes, and access tokens are signed or encrypted self-contained artifacts, so the Worker still stores no sessions or client records.
+
+| Variable | Required | Meaning |
+| --- | --- | --- |
+| `MCP_AUTH_MODE` | No | `token` (default) or `oauth` |
+| `MCP_API_TOKEN` | Yes | Static Bearer token for `/v1/*`, and for `/mcp` in token mode |
+| `URL_SIGNING_SECRET` | Yes | HMAC secret for signed stream URLs |
+| `MCP_OAUTH_RESOURCE` | OAuth mode | Canonical public MCP URL, including `/mcp` |
+| `MCP_OAUTH_SIGNING_SECRET` | OAuth mode | At least 32 random bytes used to derive purpose-separated token keys |
+| `MCP_OAUTH_LOGIN_USERNAME` | OAuth mode | Single owner username shown only to the authorization form |
+| `MCP_OAUTH_LOGIN_PASSWORD` | OAuth mode | Strong owner password of at least 16 UTF-8 bytes |
+| `MCP_OAUTH_ALLOWED_REDIRECT_URIS` | OAuth mode | Comma-separated exact redirect URIs; use the URI shown by ChatGPT, normally `https://chatgpt.com/connector_platform_oauth_redirect` when issuer identification is enabled |
+| `MCP_OAUTH_READ_SCOPES` | No | Space-separated scopes for `probe_url`, `list_archive`, and `create_stream_url`; defaults to `streamr.read` |
+| `MCP_OAUTH_WRITE_SCOPES` | No | Space-separated scopes for `transfer` and `distribute_archive`; defaults to `streamr.write` |
+| `MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS` | No | Access-token lifetime, 300–86400 seconds; defaults to 43200 |
+
+In OAuth mode, `MCP_OAUTH_RESOURCE` must exactly match the public request origin plus `/mcp`. The Worker uses that origin as its issuer and includes the exact issuer in authorization responses. Redirect URIs are matched exactly, including path and query. Rotate `MCP_OAUTH_SIGNING_SECRET` to invalidate every outstanding client registration, code, and access token.
+
+### Stateless OAuth limitation
+
+Strict OAuth authorization servers record when an authorization code is redeemed. Streamr deliberately has no database or cross-request session state, so it cannot maintain that record. A code is encrypted, bound to the exact client, redirect URI, resource, and PKCE challenge, and expires after 60 seconds, but the same client holding the verifier can redeem it again during that window.
+
+The built-in server does not issue refresh tokens because a stateless public-client flow cannot rotate them with replay detection. ChatGPT must run authorization again after the access token expires. Use the built-in OAuth mode for a private, single-owner deployment with strong random credentials and an exact redirect-URI allowlist. If policy requires provably single-use authorization codes, long-lived refresh sessions, per-token revocation, account lifecycle, MFA, or audit history, use a stateful external authorization server instead of the built-in mode.
 
 Only `http:` and `https:` URLs with DNS hostnames are accepted. URL credentials, IP literals, `file:`, `data:`, FTP, and WebSocket URLs are rejected. User-supplied header names and values are checked for CR/LF injection; hop-by-hop headers and caller-supplied `Content-Length` are forbidden.
 
@@ -184,7 +221,7 @@ Inspect the JSON `ok`, every route `status`, `warnings`, and `errors`; HTTP 200 
 
 ## MCP endpoint
 
-`POST /mcp` is a stateless Streamable HTTP endpoint. A fresh MCP server is created for each HTTP request, and MCP cancellation propagates to the active source or target. Configure the MCP client with the gateway URL and the same Bearer token used by the HTTP API. The control body is bounded at 8 MiB, and JSON-RPC batches are rejected for both modern and legacy-compatible clients so one inbound request can start at most one operation.
+`POST /mcp` is a stateless Streamable HTTP endpoint. A fresh MCP server is created for each HTTP request, and MCP cancellation propagates to the active source or target. The control body is bounded at 8 MiB, and JSON-RPC batches are rejected for both modern and legacy-compatible clients so one inbound request can start at most one operation.
 
 The server exposes exactly five tools:
 
@@ -195,6 +232,12 @@ The server exposes exactly five tools:
 | `create_stream_url` | Create a ten-minute signed `GET /v1/stream` URL |
 | `transfer` | Upload one stream; potentially mutating and non-idempotent |
 | `distribute_archive` | Upload multiple entries; potentially mutating and non-idempotent |
+
+In OAuth mode, every tool publishes a canonical `securitySchemes` declaration and the compatibility `_meta.securitySchemes` mirror. Read tools require `MCP_OAUTH_READ_SCOPES`; target-writing tools require `MCP_OAUTH_WRITE_SCOPES`. A token that is otherwise valid but lacks a required scope receives an OAuth challenge instead of starting a source or target request.
+
+### Token-mode MCP client
+
+Configure a non-ChatGPT MCP client with the gateway URL and the same Bearer token used by the HTTP API:
 
 Example with the installed MCP client package:
 
@@ -218,6 +261,19 @@ await client.close();
 ```
 
 MCP results contain both a JSON text content item and the same object in `structuredContent`. Gateway failures set `isError: true` and use the structured error model.
+
+### OAuth and ChatGPT registration
+
+ChatGPT cannot present a custom API key to an MCP server, so a ChatGPT connection must use `MCP_AUTH_MODE=oauth`. Before registering Streamr, complete all of the following:
+
+1. Deploy Streamr at a stable public HTTPS URL and set `MCP_OAUTH_RESOURCE` to the exact URL including `/mcp`.
+2. Generate independent strong values for `MCP_OAUTH_SIGNING_SECRET` and `MCP_OAUTH_LOGIN_PASSWORD`, choose the owner username, and allow only the exact production redirect URI displayed by ChatGPT. With issuer identification enabled, the stable URI is `https://chatgpt.com/connector_platform_oauth_redirect`.
+3. Confirm `/.well-known/oauth-protected-resource/mcp` and `/.well-known/oauth-authorization-server` are publicly reachable.
+4. Verify dynamic registration, the owner login form, PKCE token exchange, `tools/list` security metadata, and one read-only tool call with MCP Inspector.
+
+Then enable Developer mode in ChatGPT under **Settings → Security and login**, open **ChatGPT Plugins**, select the plus button, and create a public MCP connection using the exact `MCP_OAUTH_RESOURCE` URL. Review the five discovered tools and complete Streamr's owner login and authorization form. Developer mode and plugin availability can depend on the account or workspace policy.
+
+See the official OpenAI documentation for the current [MCP authentication contract](https://developers.openai.com/plugins/build/auth) and [ChatGPT connection workflow](https://developers.openai.com/plugins/deploy/connect-chatgpt).
 
 ### Create a signed stream URL with MCP
 
@@ -443,7 +499,7 @@ npm install
 cp .dev.vars.example .dev.vars
 ```
 
-Replace both placeholders in `.dev.vars` with different high-entropy random values. `.dev.vars` is ignored by Git and must never be committed.
+Replace both active secret placeholders in `.dev.vars` with different high-entropy random values. The example defaults to token-mode MCP authentication. To exercise OAuth locally, change `MCP_AUTH_MODE`, uncomment the OAuth variables, and use independent high-entropy OAuth signing and login secrets; `.dev.vars` is ignored by Git and must never be committed.
 
 Run the complete validation suite:
 
@@ -507,6 +563,8 @@ The deployment is one Worker named `stateless-stream-gateway-mcp` and has no sto
 
    Updating either secret creates a new Worker version; normal later deployments preserve existing secrets.
 
+   Token mode is the default and needs no additional variables. For OAuth mode, set `MCP_AUTH_MODE=oauth`, the exact `MCP_OAUTH_RESOURCE`, an independent `MCP_OAUTH_SIGNING_SECRET`, the owner login username/password, and `MCP_OAUTH_ALLOWED_REDIRECT_URIS`. Read/write scopes and the access-token lifetime are optional. These values are deployment-specific and intentionally absent from `wrangler.jsonc`; set them through Wrangler or the Cloudflare dashboard rather than committing one operator's credentials.
+
 4. Record the HTTPS URL printed by Wrangler and run smoke checks:
 
    ```sh
@@ -537,6 +595,6 @@ The deployment is one Worker named `stateless-stream-gateway-mcp` and has no sto
 
    The final command must print `401`. Confirm from the controlled source or Worker trace that authentication rejection occurred before a source fetch.
 
-5. Connect an MCP client or MCP Inspector to `$STREAMR_URL/mcp` using Streamable HTTP and the custom header `Authorization: Bearer <token>`. Invoke `probe_url`, then invoke `create_stream_url` for a small public source and fetch the returned URL before its ten-minute expiry.
+5. In token mode, connect an MCP client or MCP Inspector to `$STREAMR_URL/mcp` using Streamable HTTP and the custom header `Authorization: Bearer <token>`. In OAuth mode, use MCP Inspector's OAuth flow and verify metadata discovery, PKCE login, code exchange, and scope enforcement before registering ChatGPT. Invoke `probe_url`, then invoke `create_stream_url` for a small public source and fetch the returned URL before its ten-minute expiry.
 
 For a transfer/distribution smoke test, use a dedicated disposable target endpoint. External writes are non-atomic and are not rolled back or retried by the gateway.

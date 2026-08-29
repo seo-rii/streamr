@@ -1,3 +1,15 @@
 MCP_API_TOKEN=replace-with-a-random-token
 URL_SIGNING_SECRET=replace-with-a-random-secret
+MCP_AUTH_MODE=token
 
+# OAuth mode protects only /mcp; /v1/* continues to use MCP_API_TOKEN.
+# OAuth is self-hosted by the same Worker; no external identity provider is required.
+# Uncomment and replace these values after setting MCP_AUTH_MODE=oauth.
+# MCP_OAUTH_RESOURCE=https://streamr.example.com/mcp
+# MCP_OAUTH_SIGNING_SECRET=replace-with-at-least-32-random-bytes
+# MCP_OAUTH_LOGIN_USERNAME=streamr-owner
+# MCP_OAUTH_LOGIN_PASSWORD=replace-with-a-strong-random-password
+# MCP_OAUTH_ALLOWED_REDIRECT_URIS=https://chatgpt.com/connector_platform_oauth_redirect
+# MCP_OAUTH_READ_SCOPES=streamr.read
+# MCP_OAUTH_WRITE_SCOPES=streamr.write
+# MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS=43200

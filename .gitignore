@@ -1,6 +1,7 @@
 node_modules/
 .dev.vars
 .streamr-production.env
+.streamr-oauth-production.env
 .env
 .wrangler/
 coverage/
