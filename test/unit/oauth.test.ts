@@ -404,4 +404,25 @@ describe("configurable MCP authentication", () => {
       ),
     ).toThrowError(expect.objectContaining({ stage: "auth-config" }));
   });
+
+  it("allows access-token lifetimes up to thirty days", () => {
+    const thirtyDays = 30 * 24 * 60 * 60;
+    const config = resolveMcpAuthConfig(
+      oauthEnv({ MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS: String(thirtyDays) }),
+      RESOURCE,
+    );
+    expect(config).toMatchObject({
+      mode: "oauth",
+      accessTokenTtlSeconds: thirtyDays,
+    });
+
+    expect(() =>
+      resolveMcpAuthConfig(
+        oauthEnv({
+          MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS: String(thirtyDays + 1),
+        }),
+        RESOURCE,
+      ),
+    ).toThrowError(expect.objectContaining({ stage: "auth-config" }));
+  });
 });

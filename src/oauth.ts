@@ -10,6 +10,7 @@ import { readEmbeddedAccessToken } from "./oauth-server";
 const DEFAULT_READ_SCOPES = ["streamr.read"] as const;
 const DEFAULT_WRITE_SCOPES = ["streamr.write"] as const;
 const DEFAULT_ACCESS_TOKEN_TTL_SECONDS = 12 * 60 * 60;
+const MAX_ACCESS_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
 const MIN_SIGNING_SECRET_BYTES = 32;
 const MIN_LOGIN_PASSWORD_BYTES = 16;
 
@@ -265,7 +266,7 @@ export function resolveMcpAuthConfig(
       DEFAULT_ACCESS_TOKEN_TTL_SECONDS,
       "MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS",
       300,
-      24 * 60 * 60,
+      MAX_ACCESS_TOKEN_TTL_SECONDS,
     ),
     resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(resource),
   };

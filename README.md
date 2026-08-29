@@ -60,7 +60,7 @@ OAuth mode does not require an external identity provider. The same Worker expos
 | `MCP_OAUTH_ALLOWED_REDIRECT_URIS` | OAuth mode | Comma-separated exact redirect URIs; use the URI shown by ChatGPT, normally `https://chatgpt.com/connector_platform_oauth_redirect` when issuer identification is enabled |
 | `MCP_OAUTH_READ_SCOPES` | No | Space-separated scopes for `probe_url`, `list_archive`, and `create_stream_url`; defaults to `streamr.read` |
 | `MCP_OAUTH_WRITE_SCOPES` | No | Space-separated scopes for `transfer` and `distribute_archive`; defaults to `streamr.write` |
-| `MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS` | No | Access-token lifetime, 300–86400 seconds; defaults to 43200 |
+| `MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS` | No | Access-token lifetime, 300–2592000 seconds; defaults to 43200 (12 hours) |
 
 In OAuth mode, `MCP_OAUTH_RESOURCE` must exactly match the public request origin plus `/mcp`. The Worker uses that origin as its issuer and includes the exact issuer in authorization responses. Redirect URIs are matched exactly, including path and query. Rotate `MCP_OAUTH_SIGNING_SECRET` to invalidate every outstanding client registration, code, and access token.
 
@@ -69,6 +69,8 @@ In OAuth mode, `MCP_OAUTH_RESOURCE` must exactly match the public request origin
 Strict OAuth authorization servers record when an authorization code is redeemed. Streamr deliberately has no database or cross-request session state, so it cannot maintain that record. A code is encrypted, bound to the exact client, redirect URI, resource, and PKCE challenge, and expires after 60 seconds, but the same client holding the verifier can redeem it again during that window.
 
 The built-in server does not issue refresh tokens because a stateless public-client flow cannot rotate them with replay detection. ChatGPT must run authorization again after the access token expires. Use the built-in OAuth mode for a private, single-owner deployment with strong random credentials and an exact redirect-URI allowlist. If policy requires provably single-use authorization codes, long-lived refresh sessions, per-token revocation, account lifecycle, MFA, or audit history, use a stateful external authorization server instead of the built-in mode.
+
+Access tokens can be configured for up to 30 days for private deployments that prefer fewer reauthorization prompts. A longer lifetime increases the exposure window if a token is copied; rotating `MCP_OAUTH_SIGNING_SECRET` remains the only way to invalidate issued access tokens before expiry.
 
 Only `http:` and `https:` URLs with DNS hostnames are accepted. URL credentials, IP literals, `file:`, `data:`, FTP, and WebSocket URLs are rejected. User-supplied header names and values are checked for CR/LF injection; hop-by-hop headers and caller-supplied `Content-Length` are forbidden.
 
