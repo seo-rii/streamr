@@ -520,6 +520,22 @@ npm test
 npx wrangler deploy --dry-run
 ```
 
+OAuth login also needs a real-browser check: HTTP-only tests do not enforce
+the login page's CSP on a form's redirect to an external callback. Against a
+running OAuth-mode Worker, export its `MCP_OAUTH_RESOURCE`,
+`MCP_OAUTH_LOGIN_USERNAME`, `MCP_OAUTH_LOGIN_PASSWORD`, and
+`MCP_OAUTH_ALLOWED_REDIRECT_URIS`, plus any non-default scope or token-TTL variables.
+With Python Playwright and its Chromium browser installed, run:
+
+```sh
+python3 test/browser/oauth_login.py
+```
+
+This check covers immediate success and a wrong-password retry using native
+form submissions, PKCE token exchange, and MCP authentication. It intercepts
+the external callback locally, so it does not reconnect the actual ChatGPT
+account. Credentials, authorization codes, and tokens are never printed.
+
 Run the opt-in 1 GiB raw and target-transfer backpressure qualification with:
 
 ```sh

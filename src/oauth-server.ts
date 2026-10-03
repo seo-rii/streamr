@@ -394,9 +394,13 @@ function escapeHtml(value: string): string {
 function loginPage(input: {
   requestToken: string;
   clientName: string;
+  redirectUri: string;
   scopes: readonly string[];
   error?: string;
 }): Response {
+  // Chromium checks form-action again when the form's POST redirects externally.
+  // Only include the origin of this request's already-validated OAuth callback.
+  const redirectOrigin = new URL(input.redirectUri).origin;
   const scopeItems = input.scopes
     .map((scope) => `<li><code>${escapeHtml(scope)}</code></li>`)
     .join("");
@@ -441,7 +445,7 @@ function loginPage(input: {
     headers: oauthHeaders({
       "Content-Type": "text/html; charset=utf-8",
       "Content-Security-Policy":
-        "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+        `default-src 'none'; style-src 'unsafe-inline'; form-action 'self' ${redirectOrigin}; base-uri 'none'; frame-ancestors 'none'`,
       "X-Frame-Options": "DENY",
     }),
   });
@@ -617,7 +621,7 @@ async function beginAuthorization(
     codeChallenge,
     resource: config.resource.href,
   });
-  return loginPage({ requestToken, clientName: client.clientName, scopes });
+  return loginPage({ requestToken, clientName: client.clientName, redirectUri, scopes });
 }
 
 async function completeAuthorization(
@@ -652,6 +656,7 @@ async function completeAuthorization(
     return loginPage({
       requestToken,
       clientName: authorization.clientName,
+      redirectUri: authorization.redirectUri,
       scopes: authorization.scope.split(" "),
       error: "The username or password is invalid.",
     });

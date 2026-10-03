@@ -39,8 +39,8 @@ function oauthEnv(overrides: Partial<Record<string, string>> = {}): Env {
   } as Env;
 }
 
-function oauthConfig(): McpOAuthAuthConfig {
-  const config = resolveMcpAuthConfig(oauthEnv(), RESOURCE);
+function oauthConfig(overrides: Partial<Record<string, string>> = {}): McpOAuthAuthConfig {
+  const config = resolveMcpAuthConfig(oauthEnv(overrides), RESOURCE);
   if (config.mode !== "oauth") throw new Error("Expected OAuth mode.");
   return config;
 }
@@ -90,15 +90,25 @@ async function pkce(verifier: string): Promise<string> {
     .replace(/=+$/g, "");
 }
 
+function formActionSources(response: Response): string[] | undefined {
+  return response.headers
+    .get("Content-Security-Policy")
+    ?.split(";")
+    .map((directive) => directive.trim().split(/\s+/))
+    .find(([name]) => name === "form-action")
+    ?.slice(1);
+}
+
 async function beginAuthorization(
   clientId: string,
   verifier: string,
   config = oauthConfig(),
+  redirectUri = CALLBACK,
 ): Promise<string> {
   const query = new URLSearchParams({
     response_type: "code",
     client_id: clientId,
-    redirect_uri: CALLBACK,
+    redirect_uri: redirectUri,
     scope: "streamr.read streamr.write",
     state: "test-state",
     code_challenge: await pkce(verifier),
@@ -107,9 +117,7 @@ async function beginAuthorization(
   });
   const response = await oauthRequest(`/authorize?${query}`, {}, config);
   expect(response.status).toBe(200);
-  expect(response.headers.get("Content-Security-Policy")).toContain(
-    "form-action 'self'",
-  );
+  expect(formActionSources(response)).toEqual(["'self'", new URL(redirectUri).origin]);
   const html = await response.text();
   const token = html.match(/name="request" value="([^"]+)"/)?.[1];
   if (token === undefined) throw new Error("Missing authorization request token.");
@@ -294,6 +302,7 @@ describe("configurable MCP authentication", () => {
 
     const wrongLogin = await completeAuthorization(requestToken, "wrong-password-long", config);
     expect(wrongLogin.status).toBe(200);
+    expect(formActionSources(wrongLogin)).toEqual(["'self'", new URL(CALLBACK).origin]);
     expect(await wrongLogin.text()).toContain("username or password is invalid");
 
     const authorization = await completeAuthorization(requestToken, PASSWORD, config);
@@ -381,6 +390,58 @@ describe("configurable MCP authentication", () => {
     // redeem the same code again while it remains valid.
     const replay = await exchangeCode(code, clientId, verifier, config);
     expect(replay.status).toBe(200);
+  });
+
+  it("limits initial and retry login form actions to the selected callback origin", async () => {
+    const otherCallback = "https://other-client.example:8443/oauth/callback";
+    const config = oauthConfig({
+      MCP_OAUTH_ALLOWED_REDIRECT_URIS: `${CALLBACK},${otherCallback}`,
+    });
+
+    for (const redirectUri of [CALLBACK, otherCallback]) {
+      const clientId = await registerClient(redirectUri, config);
+      const requestToken = await beginAuthorization(
+        clientId,
+        "a".repeat(43),
+        config,
+        redirectUri,
+      );
+      const wrongLogin = await completeAuthorization(requestToken, "wrong-password-long", config);
+
+      expect(wrongLogin.status).toBe(200);
+      expect(formActionSources(wrongLogin)).toEqual(["'self'", new URL(redirectUri).origin]);
+      expect(await wrongLogin.text()).toContain("username or password is invalid");
+    }
+  });
+
+  it("rejects unregistered authorization redirects before rendering a login form", async () => {
+    const otherCallback = "https://other-client.example/oauth/callback";
+    const config = oauthConfig({
+      MCP_OAUTH_ALLOWED_REDIRECT_URIS: `${CALLBACK},${otherCallback}`,
+    });
+    const clientId = await registerClient(CALLBACK, config);
+
+    for (const redirectUri of [
+      otherCallback,
+      "https://chatgpt.com/unregistered-callback",
+      "https://attacker.example/callback",
+    ]) {
+      const query = new URLSearchParams({
+        response_type: "code",
+        client_id: clientId,
+        redirect_uri: redirectUri,
+        scope: "streamr.read streamr.write",
+        code_challenge: await pkce("a".repeat(43)),
+        code_challenge_method: "S256",
+        resource: RESOURCE,
+      });
+      const rejected = await oauthRequest(`/authorize?${query}`, {}, config);
+
+      expect(rejected.status).toBe(400);
+      expect(rejected.headers.get("Location")).toBeNull();
+      expect(rejected.headers.get("Content-Type")).toContain("application/json");
+      await expect(rejected.json()).resolves.toMatchObject({ error: "invalid_request" });
+    }
   });
 
   it("fails closed for missing secrets, unsafe redirect URIs, and origin drift", () => {
