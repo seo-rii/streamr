@@ -2,6 +2,7 @@
   "name": "streamr",
   "version": "0.2.0",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "description": "Stateless bounded-memory stream gateway and MCP server for Cloudflare Workers",
   "scripts": {
