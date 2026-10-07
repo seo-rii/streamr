@@ -520,6 +520,8 @@ Worker secret types are maintained in `src/env.d.ts` and `src/oauth.ts`;
 Use `npm run types` after updating Wrangler or the compatibility settings.
 Type checks do not depend on `.dev.vars`, so they also run in a clean checkout
 without deployment credentials.
+The Vitest configuration supplies fresh, test-only authentication and signing
+bindings for integration requests; tests never require your real API token.
 
 Useful narrower commands are:
 
