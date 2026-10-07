@@ -36,8 +36,8 @@ jobs:
           node-version: ">=24.11.0 <25"
           cache: npm
       - run: npm ci
-      - name: Check the generated vendored WASM is reproducible
-        run: git diff --exit-code -- src/vendor/xz-decompress.wasm
+      - name: Verify vendored WASM and reproducible generated modules
+        run: git diff --exit-code -- src/vendor/xz-decompress.wasm src/vendor/image
       - run: npm run check
       - name: Bundle the Worker without deploying or authenticating
         run: npx wrangler deploy --dry-run --outdir dist/ci

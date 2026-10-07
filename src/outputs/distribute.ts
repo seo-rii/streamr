@@ -249,7 +249,7 @@ export async function distributeArchive(
           let transformed = await applyEntryTransforms(
             isolated.byteStream,
             prepared.route.transforms,
-            { allowMultipartFormData: true },
+            { allowMultipartFormData: true, ...(signal === undefined ? {} : { signal }) },
           );
           transformed = limitEntryBytes(transformed);
           transformed = await inferByteStreamContentType(transformed);

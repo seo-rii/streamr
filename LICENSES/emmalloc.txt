@@ -1,0 +1,16 @@
+emmalloc allocator copyright and license notice
+==============================================
+
+Source: Emscripten 4.0.17, system/lib/emmalloc.c
+https://github.com/emscripten-core/emscripten/blob/4.0.17/system/lib/emmalloc.c
+
+The copyright and licensing portion of the upstream source header is:
+
+ * Copyright 2018 The Emscripten Authors.  All rights reserved.
+ * Emscripten is available under two separate licenses, the MIT license and the
+ * University of Illinois/NCSA Open Source License.  Both these licenses can be
+ * found in the LICENSE file.
+
+The complete MIT/NCSA terms referenced by this notice are preserved in
+emscripten.txt alongside this file. Streamr's native WebP modules select this
+allocator with -sMALLOC=emmalloc.

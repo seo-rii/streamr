@@ -6,8 +6,9 @@
   "type": "module",
   "description": "Stateless bounded-memory stream gateway and MCP server for Cloudflare Workers",
   "scripts": {
-    "postinstall": "patch-package && npm run generate:xz-wasm",
+    "postinstall": "patch-package && npm run generate:xz-wasm && npm run generate:image-wasm",
     "generate:xz-wasm": "node scripts/extract-xz-wasm.mjs",
+    "generate:image-wasm": "node scripts/prepare-image-wasm.mjs",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "types": "wrangler types --include-env=false",
@@ -19,6 +20,8 @@
     "check": "npm run check:types && npm run lint && npm test"
   },
   "dependencies": {
+    "@jsquash/jpeg": "1.6.0",
+    "@jsquash/png": "3.1.1",
     "@modelcontextprotocol/server": "2.0.0",
     "@openpgp/unbzip2-stream": "2.0.0",
     "agents": "0.21.0",

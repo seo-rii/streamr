@@ -111,6 +111,40 @@ const multipartFormTransformSchema = z
   })
   .strict();
 
+export const imageTransformSchema = z
+  .object({
+    type: z.literal("image"),
+    format: z.enum(["jpeg", "png", "webp"]),
+    quality: z.number().int().min(1).max(100).optional(),
+    resize: z.object({
+      width: z.number().int().min(1).max(4096).optional(),
+      height: z.number().int().min(1).max(4096).optional(),
+      fit: z.enum(["scale-down", "contain", "cover"]).default("scale-down"),
+    }).strict().optional(),
+    background: z.string().regex(/^#[0-9a-fA-F]{6}$/).optional(),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    if (value.format === "png" && value.quality !== undefined) {
+      context.addIssue({ code: "custom", message: "PNG output is lossless and does not accept quality.", path: ["quality"] });
+    }
+    if (value.background !== undefined && value.format !== "jpeg") {
+      context.addIssue({ code: "custom", message: "A background is only used for JPEG output.", path: ["background"] });
+    }
+    if (value.resize !== undefined) {
+      if (value.resize.width === undefined && value.resize.height === undefined) {
+        context.addIssue({ code: "custom", message: "Image resize requires width or height.", path: ["resize"] });
+      }
+      if (value.resize.fit === "cover" && (value.resize.width === undefined || value.resize.height === undefined)) {
+        context.addIssue({ code: "custom", message: "Cover resize requires both width and height.", path: ["resize"] });
+      }
+      if (value.resize.width !== undefined && value.resize.height !== undefined &&
+        value.resize.width * value.resize.height > 1_000_000) {
+        context.addIssue({ code: "custom", message: "The image resize box must not exceed 1,000,000 pixels.", path: ["resize"] });
+      }
+    }
+  });
+
 export const entryTransformSchema = z.discriminatedUnion("type", [
   decompressTransformSchema,
   newlineTransformSchema,
@@ -121,6 +155,7 @@ export const entryTransformSchema = z.discriminatedUnion("type", [
   limitTransformSchema,
   gzipTransformSchema,
   multipartFormTransformSchema,
+  imageTransformSchema,
 ]);
 
 export const finalTransformSchema = z.discriminatedUnion("type", [
@@ -222,6 +257,7 @@ export type ListRequest = z.infer<typeof listRequestSchema>;
 export type EntrySelector = z.infer<typeof entrySelectorSchema>;
 export type ArchiveSelectionSpec = z.infer<typeof archiveSelectionSchema>;
 export type EntryTransformSpec = z.infer<typeof entryTransformSchema>;
+export type ImageTransformSpec = z.infer<typeof imageTransformSchema>;
 export type FinalTransformSpec = z.infer<typeof finalTransformSchema>;
 export type HttpTargetSpec = z.infer<typeof targetSchema>;
 export type StreamRequest = z.infer<typeof streamRequestSchema>;

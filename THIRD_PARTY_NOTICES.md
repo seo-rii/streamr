@@ -29,6 +29,23 @@ The module also incorporates these dependencies, pinned by the upstream v0.2.3 g
 
 The upstream native `memcpy` helper also matches OS/161's implementation, with comments and optional single-statement loop braces changed. Its source provenance and the [original Harvard BSD-3-Clause notice](LICENSES/os161-memcpy.txt) are recorded in [the XZ provenance document](LICENSES/xz-decompress.md#native-memcpy-provenance).
 
+## Image WASM codecs and adapted bindings
+
+The `image` transform bundles memory-capped JPEG/PNG WASM binaries from the following locked npm distributions. Their package-level Apache-2.0 license files are identical and are preserved in [the jSquash license](LICENSES/jsquash.txt); native codec terms remain applicable as well.
+
+| Package | Package and codec terms |
+| --- | --- |
+| [`@jsquash/jpeg` 1.6.0](https://github.com/jamsinclair/jSquash/tree/1f62015f53e28bd18b2d7c8a3ca3326577efc445/packages/jpeg) | Apache-2.0 wrapper; [upstream libjpeg-turbo IJG/BSD/zlib licensing roll-up](LICENSES/jsquash-jpeg-codec.md) and [IJG README](LICENSES/README.ijg) |
+| [`@jsquash/png` 3.1.1](https://github.com/jamsinclair/jSquash/tree/b7fa9ac9ec02f224847ad23d19d115f9e296a368/packages/png) | Apache-2.0 Squoosh wrapper; [provided Google BSD-3-Clause codec notice](LICENSES/jsquash-png-codec.txt) and [Rust dependency MIT/Unicode notices](LICENSES/jsquash-png-rust.txt) |
+
+This software is based in part on the work of the Independent JPEG Group.
+
+`scripts/prepare-image-wasm.mjs` validates each JPEG/PNG upstream binary's SHA-256 and changes only its memory declaration to enforce a 32 MiB maximum per instance. The checked-in JPEG/PNG files under `src/vendor/image/` are modified binaries. The PNG per-operation adapter in `src/transforms/image-codecs.ts` is adapted from upstream Apache-2.0 wasm-bindgen glue.
+
+WebP is compiled from official [libwebp 1.6.0](https://github.com/webmproject/libwebp/tree/v1.6.0) source with Emscripten 4.0.17, using Streamr's original MIT-licensed C bridge. Its [BSD-3-Clause license](LICENSES/libwebp.txt) and [patent grant](LICENSES/libwebp-patents.txt) are retained. The native build also retains [Emscripten's MIT/NCSA notice](LICENSES/emscripten.txt), [emmalloc's additional 2018 copyright notice](LICENSES/emmalloc.txt), [musl's copyright notice](LICENSES/musl.txt), and [compiler-rt's Apache-2.0 with LLVM exceptions and legacy license texts](LICENSES/compiler-rt.txt). No npm WebP wrapper is included.
+
+[Image codec provenance](LICENSES/image-codecs.md) records original JPEG/PNG file hashes, pinned upstream revisions, the native WebP build/rebuild process, runtime notices, and the PNG npm notice's licensing inconsistency without silently replacing its terms. Ordinary dependency installation regenerates JPEG/PNG modules and verifies the separately built WebP artifacts.
+
 ## Other archive dependencies
 
 These packages are installed from npm, not vendored as source files. Their license texts are included for reference and retention when distributing a built Worker bundle:

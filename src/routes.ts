@@ -75,9 +75,11 @@ async function transformEntry(
   byteStream: ByteStream,
   transforms: Parameters<typeof applyEntryTransforms>[1],
   allowMultipartFormData: boolean,
+  signal: AbortSignal,
 ): Promise<ByteStream> {
   const transformed = await applyEntryTransforms(byteStream, transforms, {
     allowMultipartFormData,
+    signal,
   });
   return limitEntryBytes(transformed);
 }
@@ -206,7 +208,7 @@ async function executeStream(
   log?.observeSource(source);
   try {
     if (input.archive === undefined) {
-      const entryOutput = await transformEntry(source.byteStream, input.entryTransforms, false);
+      const entryOutput = await transformEntry(source.byteStream, input.entryTransforms, false, signal);
       const finalOutput = await inferByteStreamContentType(
         limitBytes(
           await applyFinalTransforms(entryOutput, input.finalTransforms),
@@ -247,7 +249,7 @@ async function executeStream(
     }
 
     const selected = await selectSingleEntry(archive, input.archive.entries[0]!);
-    const entryOutput = await transformEntry(selected.byteStream, input.entryTransforms, false);
+    const entryOutput = await transformEntry(selected.byteStream, input.entryTransforms, false, signal);
     const finalOutput = await inferByteStreamContentType(
       limitBytes(
         await applyFinalTransforms(entryOutput, input.finalTransforms),
@@ -300,7 +302,7 @@ async function executeTransfer(
         await selectSingleEntry(archive, input.archive.entries[0]!)
       ).byteStream;
     }
-    byteStream = await transformEntry(byteStream, input.entryTransforms, true);
+    byteStream = await transformEntry(byteStream, input.entryTransforms, true, signal);
     byteStream = await inferByteStreamContentType(byteStream);
     const result = await uploadByteStream(byteStream, input.target, signal);
     log?.patch({ bytesWritten: result.bytesWritten });

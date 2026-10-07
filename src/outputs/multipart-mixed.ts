@@ -118,6 +118,7 @@ export async function createMultipartMixedStream(
     entryTransforms,
     boundary,
     onManifest,
+    signal,
   );
   const base = iteratorByteStream(iterator, archive, signal, {
     contentType: `multipart/mixed; boundary=${boundary}`,
@@ -179,6 +180,7 @@ async function* encodeMultipartArchive(
   transforms: readonly EntryTransformSpec[],
   boundary: string,
   onManifest?: (manifest: MultipartMixedManifest, stats: MultipartMixedStats) => void,
+  signal?: AbortSignal,
 ): AsyncGenerator<Uint8Array> {
   const selected = new Map(
     selectors.map((selector) => [selectorKey(selector.path, selector.occurrence), selector]),
@@ -261,6 +263,7 @@ async function* encodeMultipartArchive(
       try {
         let transformed = await applyEntryTransforms(shield.byteStream, transforms, {
           allowMultipartFormData: false,
+          ...(signal === undefined ? {} : { signal }),
         });
         transformed = limitEntryBytes(transformed);
         transformed = await inferByteStreamContentType(transformed);

@@ -1,6 +1,6 @@
 # streamr
 
-`streamr` is an open-source, stateless, bounded-memory HTTP stream gateway and MCP server for Cloudflare Workers. Version 0.2 downloads one HTTP/HTTPS source per operation, optionally scans an archive in source order, applies predefined streaming transforms, and either streams the result to the caller or uploads selected entries to HTTP targets.
+`streamr` is an open-source, stateless, bounded-memory HTTP stream gateway and MCP server for Cloudflare Workers. Version 0.2 downloads one HTTP/HTTPS source per operation, optionally scans an archive in source order, applies predefined transforms, and either streams the result to the caller or uploads selected entries to HTTP targets. Optional image transforms decode and encode JPEG, PNG, and WebP inside the Worker using bundled WASM codecs.
 
 Streamr's original code is [MIT-licensed](LICENSE). Bundled components and dependency patches retain their own licenses; see [third-party notices](THIRD_PARTY_NOTICES.md).
 
@@ -8,7 +8,8 @@ The Worker has no R2, KV, D1, Durable Objects, Queues, Containers, cache, jobs, 
 
 ## Streaming model
 
-- Source archives and extracted entries are never buffered in full. Payload memory consists of decoder state, bounded input batches, and bounded output queues; metadata grows with the number of listed or selected entries.
+- Normal byte transforms never buffer source archives or extracted entries in full. Payload memory consists of decoder state, bounded input batches, and bounded output queues; metadata grows with the number of listed or selected entries.
+- The opt-in `image` transform is a bounded-buffer exception: it retains one image's encoded input, decoded pixels, and encoded output within explicit [image limits](#image-conversion). It never buffers the containing archive or every selected image together.
 - ZIP and TAR-family archives are scanned once, in archive order. Request order never reorders the output.
 - Only one archive entry and, for distribution, one target upload are active at a time. A slow client or target propagates backpressure to the entry decoder and source fetch.
 - Each discovered entry is opened or skipped before the next entry advances. Once every requested entry is complete, the remaining source may be cancelled early.
@@ -431,10 +432,60 @@ Entry transforms run in order and are applied independently to each selected fil
 | `prepend`, `append` | UTF-8 or base64 bytes, up to 64 KiB each |
 | `slice` | Byte offset and optional byte length |
 | `limit` | Aborts once `maxBytes` is exceeded |
+| `image` | Worker-local WASM JPEG/PNG/WebP conversion, lossy quality, and bounded resizing |
 | `gzip` | GZIP-encodes the current entry or final stream |
 | `multipart-form-data` | Wraps one target upload; must be the final route/transfer entry transform |
 
 Only `limit` and `gzip` are valid final transforms for a raw result. A `multipart/mixed` result permits only final `gzip`: a caller-supplied final byte limit is rejected before source fetch because it could prevent the mandatory manifest from being emitted. Text transforms are never applied to an already encoded multipart envelope. Invalid UTF-8 is an error; arbitrary JavaScript, regex replacement, ZIP/TAR repackaging, and arbitrary code execution are not supported.
+
+### Image conversion
+
+Use an `image` entry transform on a raw source or selected archive file. The format changes through actual decoding and encoding, not by renaming the file:
+
+```json
+{
+  "source": { "url": "https://files.example/photo.png" },
+  "entryTransforms": [
+    {
+      "type": "image",
+      "format": "webp",
+      "quality": 80,
+      "resize": { "width": 800, "height": 800, "fit": "scale-down" }
+    }
+  ],
+  "output": { "mode": "raw" }
+}
+```
+
+The same transform can be used by `create_stream_url`, `transfer`, common multipart entry transforms, or individual distribution routes. For example, one ZIP image route can encode JPEG while another encodes WebP; processing still follows archive order with one active entry and target.
+
+| Option | Behavior |
+| --- | --- |
+| `format` | Required: `jpeg`, `png`, or `webp`; input is detected from its bytes |
+| `quality` | Integer 1–100 for JPEG or lossy WebP; default 80; rejected for PNG |
+| `resize.width`, `resize.height` | Positive integer bounds; at least one is required when `resize` is present |
+| `resize.fit: "scale-down"` | Default; preserve aspect ratio within the supplied bounds without enlarging |
+| `resize.fit: "contain"` | Preserve aspect ratio within the supplied bounds, allowing enlargement; no padded canvas |
+| `resize.fit: "cover"` | Fill the exact width and height with a centered crop; both bounds are required |
+| `background` | JPEG-only `#RRGGBB` matte for transparency; default `#ffffff` |
+
+JPEG and WebP quality controls lossy encoding and does not guarantee a smaller file. PNG encoding is lossless for the decoded pixel buffer. The pipeline uses 8-bit RGBA pixels, applies EXIF orientation before resizing, and does not preserve the input's EXIF, comments, or other metadata. PNG and WebP retain alpha; JPEG flattens it onto the chosen background. WebP stores the decoded alpha values exactly in an uncompressed `ALPH` plane to keep codec memory bounded, so transparent WebP files can be larger than files using compressed alpha; `quality` affects RGB, and no alpha-compression option is exposed. Opaque WebP encoding is unaffected. Resizing uses JavaScript bilinear sampling with premultiplied alpha; decoding and encoding use WASM.
+
+The generated stream carries `image/jpeg`, `image/png`, or `image/webp` and a filename ending in `.jpg`, `.png`, or `.webp`. Explicit output or target overrides still take priority. The encoded result has an exact known length, so `requireContentLength: true` works when no later transform discards that length. Following `gzip` or `multipart-form-data` makes the length unknown again.
+
+Images require complete decoded pixel buffers, so this operator has fixed ceilings rather than the normal chunkwise payload contract:
+
+- Encoded input: 4 MiB maximum, even when the source has no `Content-Length`.
+- Encoded input dimensions: no side above 4,096 pixels and no more than 1,000,000 pixels. Headers and container structure are checked **before decoding or resizing**; a large photo cannot bypass the input pixel limit by requesting a small thumbnail.
+- Resized output: the same dimension and pixel limits; encoded output: 8 MiB maximum.
+- Each fresh WASM codec instance has a 32 MiB internal linear-memory maximum. Codec memory and temporary pixel/input buffers are cleared when processing finishes; output storage is cleared when consumed or cancelled.
+- One image operation is admitted per Worker isolate, including any unread encoded output. A concurrent image operation receives retryable `IMAGE_BUSY` (HTTP 503); the gateway does not queue image payloads. The permit is released when the output is consumed or cancelled. Separate isolates have separate permits.
+
+This version supports static JPEG, PNG, and WebP only. GIF, AVIF, SVG, HEIC, animated PNG/WebP, and PNG compressed ancillary metadata (`iCCP`, `zTXt`, compressed `iTXt`) are rejected. These ceilings are fixed in the implementation, not environment-variable tuning knobs. Codec allocation or format failures can still reject an image within the byte/pixel limits.
+
+Only one `image` transform is permitted per entry. After it, only `limit`, `gzip`, or a final target `multipart-form-data` wrapper is allowed. Image option and transform ordering errors are rejected before fetching the source. Image inspection and conversion errors use `IMAGE_FORMAT_UNSUPPORTED` (415), `IMAGE_INVALID` (422), or `IMAGE_LIMIT_EXCEEDED` (413); multipart/distribution operations report them through their existing manifest or route-result contract.
+
+No Cloudflare Images binding, external image service, native container, or additional secret is required. Image work consumes the Worker's CPU and isolate memory. JPEG/PNG use pinned jSquash WASM modules; WebP is built from official libwebp 1.6.0 with an original C bridge. All modules are bundled as static WASM imports. Dependency installation regenerates memory-capped JPEG/PNG modules and verifies the native WebP artifacts. See [codec provenance, rebuild instructions, and licenses](LICENSES/image-codecs.md).
 
 ## Default limits and bounded-memory ceilings
 
@@ -459,6 +510,9 @@ Only `limit` and `gzip` are valid final transforms for a raw result. A `multipar
 | BZIP2 input batch / decoder block | 4 KiB / at most 900 KiB |
 | ZSTD input batch / callback queue / window | 4 KiB / 8 MiB / 16 MiB |
 | XZ decoder memory | 32 MiB |
+| Image encoded input / output | 4 MiB / 8 MiB |
+| Image input and output dimensions / pixels | 4,096 per side / 1,000,000 pixels |
+| Image codec internal memory / active image operations | 32 MiB per instance / 1 per isolate |
 
 These are gateway ceilings, not guarantees that every Cloudflare plan or upstream permits a transfer of that size or duration. The Worker config requests 300,000 ms CPU time and 20,000 subrequests and therefore requires a paid Workers Standard usage model; account-level limits and the platform's 128 MiB isolate ceiling still apply.
 
@@ -482,7 +536,7 @@ Control-plane failures use a structured body:
 }
 ```
 
-Typical status classes are 400 for input/transform errors, 401 for Bearer authentication, 403 for signed URLs, 404 for a missing single entry, 413 for limits, 415 for unsupported formats, 422 for corrupt archives, 502 for source/target failures, and 504 for timeouts.
+Typical status classes are 400 for input/transform errors, 401 for Bearer authentication, 403 for signed URLs, 404 for a missing single entry, 413 for limits, 415 for unsupported formats, 422 for corrupt archives or invalid images, 502 for source/target failures, 503 for an occupied image permit, and 504 for timeouts.
 
 Requests receive a random `requestId` and emit structured logs. Do not add source or target bodies, response bodies, authorization headers, cookies, signed payloads, or complete query strings to logging. Watch a deployment with:
 
@@ -505,7 +559,7 @@ npm ci
 cp .dev.vars.example .dev.vars
 ```
 
-Replace both active secret placeholders in `.dev.vars` with different high-entropy random values. The example defaults to token-mode MCP authentication; `.dev.vars` is ignored by Git and must never be committed. Dependency installation applies the checked-in patches and reproducibly extracts the pinned XZ WASM module, so do not disable npm install scripts.
+Replace both active secret placeholders in `.dev.vars` with different high-entropy random values. The example defaults to token-mode MCP authentication; `.dev.vars` is ignored by Git and must never be committed. Dependency installation applies the checked-in patches, reproducibly extracts the pinned XZ WASM module, regenerates memory-capped JPEG/PNG WASM, and verifies the checked-in native WebP artifacts, so do not disable npm install scripts. `npm run generate:image-wasm` repeats the image preparation and verification without a native compiler. The separate [WebP rebuild instructions](LICENSES/image-codecs.md#native-webp-build) describe deliberately replacing its source-built artifacts.
 
 Run the default validation suite (generated types, TypeScript, lint, and Vitest):
 
@@ -575,14 +629,15 @@ RUN_STREAMR_STRESS=1 npx vitest run \
   test/stress/bounded-streaming.test.ts
 ```
 
-The automated suite covers route authentication, signed URLs, stream transforms, ZIP/TAR and compression adapters, multipart manifests, sequential distribution, cancellation, target edge cases, bounded decoder behavior, a default 200-entry/200-target case, and the opt-in synthetic 1 GiB raw/transfer cases. The synthetic tests validate pull/backpressure bounds without allocating a 1 GiB fixture. Before relying on production-scale workloads, also test controlled network source and sink services on the intended Workers plan while observing memory, CPU, wall-time, disconnect, and timeout behavior.
+The automated suite covers route authentication, signed URLs, stream transforms, actual WASM image conversions and limits, ZIP/TAR and compression adapters, multipart manifests, sequential distribution, cancellation, target edge cases, bounded decoder behavior, a default 200-entry/200-target case, and the opt-in synthetic 1 GiB raw/transfer cases. The synthetic tests validate pull/backpressure bounds without allocating a 1 GiB fixture. Before relying on production-scale workloads, also test controlled network source and sink services on the intended Workers plan while observing memory, CPU, wall-time, disconnect, and timeout behavior.
 
 ### GitHub Actions
 
 [CI](https://github.com/seo-rii/streamr/actions/workflows/ci.yml) runs on pushes to
 `main` and pull requests. It installs the locked dependencies with `npm ci`, runs
-`npm run check`, verifies that XZ WASM regeneration leaves the checked-in binary
-unchanged, checks Worker packaging with `wrangler deploy --dry-run`, and runs the
+`npm run check`, verifies that XZ/JPEG/PNG WASM regeneration leaves the checked-in binaries
+unchanged and that native WebP artifacts match their recorded hashes and build inputs,
+checks Worker packaging with `wrangler deploy --dry-run`, and runs the
 isolated Chromium OAuth regression. Actions are pinned to commit hashes and have
 read-only repository permissions. No Cloudflare token or production secret is
 required, and the workflow never deploys a Worker.

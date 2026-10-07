@@ -5,6 +5,7 @@ import type { ByteStream } from "../streams/byte-stream";
 import { appendBytes, decodeAffix, prependBytes } from "./affix";
 import { decompressStream } from "./decompress";
 import { gzipStream } from "./gzip";
+import { transformImage, validateImageTransform } from "./image";
 import { limitBytes } from "./limit";
 import { multipartFormData, validateMultipartOptions } from "./multipart-form";
 import { normalizeNewlines } from "./newline";
@@ -18,8 +19,19 @@ export function validateEntryTransforms(
 ): void {
   validateCount(transforms);
   let binaryOutput = false;
+  let imageOutput = false;
   transforms.forEach((transform, index) => {
+    if (imageOutput && transform.type !== "limit" && transform.type !== "gzip" &&
+      transform.type !== "multipart-form-data") {
+      invalid("Only limit, gzip, or multipart-form-data may follow an image transform.");
+    }
     switch (transform.type) {
+      case "image":
+        if (binaryOutput) invalid("An image transform cannot follow a binary envelope transform.");
+        validateImageTransform(transform);
+        imageOutput = true;
+        binaryOutput = true;
+        break;
       case "decompress":
         binaryOutput = false;
         break;
@@ -93,6 +105,9 @@ export async function applyEntryTransforms(
   let output = input;
   for (const transform of transforms) {
     switch (transform.type) {
+      case "image":
+        output = await transformImage(output, transform, options.signal);
+        break;
       case "decompress":
         output = await decompressStream(output, transform.format);
         break;

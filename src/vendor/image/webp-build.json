@@ -1,0 +1,88 @@
+{
+  "formatVersion": 1,
+  "libwebp": {
+    "version": "1.6.0",
+    "tag": "v1.6.0",
+    "commit": "4fa21912338357f89e4fd51cf2368325b59e9bd9",
+    "source": {
+      "url": "https://storage.googleapis.com/downloads.webmproject.org/releases/webp/libwebp-1.6.0.tar.gz",
+      "sha256": "e4ab7009bf0629fd11982d4c2aa83964cf244cffba7347ecd39019a9e38c4564"
+    }
+  },
+  "toolchain": {
+    "name": "Emscripten",
+    "version": "4.0.17",
+    "release": "41d2106c68c28e101e6252a48e22c78b07722508",
+    "platform": "linux-x64",
+    "url": "https://storage.googleapis.com/webassembly/emscripten-releases-builds/linux/41d2106c68c28e101e6252a48e22c78b07722508/wasm-binaries.tar.xz",
+    "sha256": "5e4269ab4d4dd97da93f2833bb97780ef6ddee9a7325d345587bddf8890d89aa"
+  },
+  "inputs": [
+    {
+      "path": "src/native/image-webp.c",
+      "sha256": "9dc819fadd09b291b8a5d896e921b20560446c0a947f698a5a775283b5e0c31a"
+    },
+    {
+      "path": "scripts/build-webp-wasm.mjs",
+      "sha256": "b8e34bcdcdd09c667863d8b0a3faaa3232ea798cf8927ff493fd0d1a9495e2eb"
+    }
+  ],
+  "artifacts": [
+    {
+      "path": "src/vendor/image/webp-dec.wasm",
+      "sha256": "aca45384806ada285a9f3d418863e722958a15672689797d6e301ccd1b0a2d91",
+      "version": 67072,
+      "maxMemoryPages": 512
+    },
+    {
+      "path": "src/vendor/image/webp-enc.wasm",
+      "sha256": "cac0d0614e1fdb61d10156dff02ef46d90f5b1c8a07a0febaf77657baa21954d",
+      "version": 67072,
+      "maxMemoryPages": 512
+    }
+  ],
+  "build": {
+    "cmakeOptions": [
+      "-G",
+      "Ninja",
+      "-DCMAKE_BUILD_TYPE=Release",
+      "-DCMAKE_C_FLAGS_RELEASE=-O3 -DNDEBUG",
+      "-DBUILD_SHARED_LIBS=OFF",
+      "-DWEBP_LINK_STATIC=ON",
+      "-DWEBP_ENABLE_SIMD=OFF",
+      "-DWEBP_USE_THREAD=OFF",
+      "-DWEBP_BUILD_ANIM_UTILS=OFF",
+      "-DWEBP_BUILD_CWEBP=OFF",
+      "-DWEBP_BUILD_DWEBP=OFF",
+      "-DWEBP_BUILD_GIF2WEBP=OFF",
+      "-DWEBP_BUILD_IMG2WEBP=OFF",
+      "-DWEBP_BUILD_VWEBP=OFF",
+      "-DWEBP_BUILD_WEBPINFO=OFF",
+      "-DWEBP_BUILD_LIBWEBPMUX=OFF",
+      "-DWEBP_BUILD_WEBPMUX=OFF",
+      "-DWEBP_BUILD_EXTRAS=OFF",
+      "-DWEBP_BUILD_WEBP_JS=OFF",
+      "-DWEBP_BUILD_FUZZTEST=OFF"
+    ],
+    "linkOptions": [
+      "-O3",
+      "-DNDEBUG",
+      "--no-entry",
+      "-sSTANDALONE_WASM=1",
+      "-sALLOW_MEMORY_GROWTH=1",
+      "-sINITIAL_MEMORY=8388608",
+      "-sMAXIMUM_MEMORY=33554432",
+      "-sSTACK_SIZE=65536",
+      "-sFILESYSTEM=0",
+      "-sMALLOC=emmalloc",
+      "-sABORTING_MALLOC=0",
+      "-sASSERTIONS=0"
+    ],
+    "decoderDefine": "STREAMR_WEBP_DECODER=1",
+    "encoderDefine": "STREAMR_WEBP_ENCODER=1",
+    "pathMappings": {
+      "scratch": "/streamr-webp-build",
+      "repository": "/streamr"
+    }
+  }
+}

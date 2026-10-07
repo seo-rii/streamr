@@ -1,6 +1,7 @@
 export { appendBytes, decodeAffix, prependBytes } from "./affix";
 export { decompressStream } from "./decompress";
 export { gzipStream } from "./gzip";
+export { transformImage } from "./image";
 export { limitBytes, limitEntryBytes } from "./limit";
 export { multipartFormData } from "./multipart-form";
 export { normalizeNewlines } from "./newline";
