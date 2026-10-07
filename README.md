@@ -2,6 +2,8 @@
 
 `streamr` is an open-source, stateless, bounded-memory HTTP stream gateway and MCP server for Cloudflare Workers. Version 0.2 downloads one HTTP/HTTPS source per operation, optionally scans an archive in source order, applies predefined streaming transforms, and either streams the result to the caller or uploads selected entries to HTTP targets.
 
+Streamr's original code is [MIT-licensed](LICENSE). Bundled components and dependency patches retain their own licenses; see [third-party notices](THIRD_PARTY_NOTICES.md).
+
 The Worker has no R2, KV, D1, Durable Objects, Queues, Containers, cache, jobs, or cross-request session state. Every `probe`, `list`, `stream`, `transfer`, or `distribute` request starts a new source download and discards all request state when it ends.
 
 ## Streaming model
@@ -273,7 +275,9 @@ ChatGPT cannot present a custom API key to an MCP server, so a ChatGPT connectio
 3. Confirm `/.well-known/oauth-protected-resource/mcp` and `/.well-known/oauth-authorization-server` are publicly reachable.
 4. Verify dynamic registration, the owner login form, PKCE token exchange, `tools/list` security metadata, and one read-only tool call with MCP Inspector.
 
-Then enable Developer mode in ChatGPT under **Settings → Security and login**, open **ChatGPT Plugins**, select the plus button, and create a public MCP connection using the exact `MCP_OAUTH_RESOURCE` URL. Review the five discovered tools and complete Streamr's owner login and authorization form. Developer mode and plugin availability can depend on the account or workspace policy.
+In [ChatGPT Plugins](https://chatgpt.com/plugins), select the plus button and **Add custom MCP server**. Enter a name and description, choose the public endpoint connection, and enter the exact `MCP_OAUTH_RESOURCE` URL. Configure OAuth authentication, review the risk warning, and choose **Create as a plugin**. Streamr supports dynamic client registration (DCR); no manually provisioned client secret is needed. Review the five discovered tools and complete Streamr's owner login and authorization form. Install the resulting plugin and select it in a new conversation. Availability and UI labels depend on the account and workspace policy.
+
+This connects your own deployment; publishing this source repository does not publish your Worker credentials or make its tools unauthenticated. Do not enter the REST `MCP_API_TOKEN` as the OAuth login password. After changing the MCP tool or authentication metadata, refresh the connection in ChatGPT and retest in a new conversation.
 
 See the official OpenAI documentation for the current [MCP authentication contract](https://developers.openai.com/plugins/build/auth) and [ChatGPT connection workflow](https://developers.openai.com/plugins/deploy/connect-chatgpt).
 
@@ -490,24 +494,26 @@ npx wrangler tail
 
 Requirements:
 
-- Node.js 24 or newer
+- Node.js 24.11 or newer (the locked tooling requires at least 24.11 on Node 24)
 - npm
 - A Cloudflare account only for deployment
 
 Install dependencies and create local-only secrets:
 
 ```sh
-npm install
+npm ci
 cp .dev.vars.example .dev.vars
 ```
 
-Replace both active secret placeholders in `.dev.vars` with different high-entropy random values. The example defaults to token-mode MCP authentication. To exercise OAuth locally, change `MCP_AUTH_MODE`, uncomment the OAuth variables, and use independent high-entropy OAuth signing and login secrets; `.dev.vars` is ignored by Git and must never be committed.
+Replace both active secret placeholders in `.dev.vars` with different high-entropy random values. The example defaults to token-mode MCP authentication; `.dev.vars` is ignored by Git and must never be committed. Dependency installation applies the checked-in patches and reproducibly extracts the pinned XZ WASM module, so do not disable npm install scripts.
 
-Run the complete validation suite:
+Run the default validation suite (generated types, TypeScript, lint, and Vitest):
 
 ```sh
 npm run check
 ```
+
+This command does not run the standalone Chromium OAuth regression or the two opt-in 1 GiB stress cases. Those checks are described separately below.
 
 Useful narrower commands are:
 
@@ -521,14 +527,31 @@ npx wrangler deploy --dry-run
 ```
 
 OAuth login also needs a real-browser check: HTTP-only tests do not enforce
-the login page's CSP on a form's redirect to an external callback. Against a
-running OAuth-mode Worker, export its `MCP_OAUTH_RESOURCE`,
-`MCP_OAUTH_LOGIN_USERNAME`, `MCP_OAUTH_LOGIN_PASSWORD`, and
-`MCP_OAUTH_ALLOWED_REDIRECT_URIS`, plus any non-default scope or token-TTL variables.
-With Python Playwright and its Chromium browser installed, run:
+the login page's CSP on a form's redirect to an external callback. On Linux or
+macOS with Python 3.12 or newer, install Python Playwright and Chromium in an isolated environment,
+then run the self-contained local check:
 
 ```sh
-python3 test/browser/oauth_login.py
+python3 -m venv .venv
+.venv/bin/python -m pip install playwright==1.61.0
+.venv/bin/python -m playwright install chromium
+.venv/bin/python scripts/ci-oauth-browser.py
+```
+
+On a minimal Linux machine, Playwright's `install --with-deps chromium` command
+also installs the browser's system dependencies and may require administrator
+access. The runner starts an isolated HTTPS Worker with random, temporary test
+credentials; it does not read the repository's `.dev.vars` or production secrets.
+Use `--port 8788` if the runner's default port, 8787, is already in use. Temporary
+credentials are removed on exit; private diagnostic logs remain in `~/logs`.
+
+To test an already running OAuth-mode Worker instead, export its
+`MCP_OAUTH_RESOURCE`, `MCP_OAUTH_LOGIN_USERNAME`, `MCP_OAUTH_LOGIN_PASSWORD`, and
+`MCP_OAUTH_ALLOWED_REDIRECT_URIS`, plus any non-default scope or token-TTL variables,
+then run:
+
+```sh
+.venv/bin/python test/browser/oauth_login.py
 ```
 
 This check covers immediate success and a wrong-password retry using native
@@ -544,13 +567,47 @@ RUN_STREAMR_STRESS=1 npx vitest run \
   test/stress/bounded-streaming.test.ts
 ```
 
-Start the local Worker:
+The automated suite covers route authentication, signed URLs, stream transforms, ZIP/TAR and compression adapters, multipart manifests, sequential distribution, cancellation, target edge cases, bounded decoder behavior, a default 200-entry/200-target case, and the opt-in synthetic 1 GiB raw/transfer cases. The synthetic tests validate pull/backpressure bounds without allocating a 1 GiB fixture. Before relying on production-scale workloads, also test controlled network source and sink services on the intended Workers plan while observing memory, CPU, wall-time, disconnect, and timeout behavior.
+
+### GitHub Actions
+
+[CI](https://github.com/seo-rii/streamr/actions/workflows/ci.yml) runs on pushes to
+`main` and pull requests. It installs the locked dependencies with `npm ci`, runs
+`npm run check`, verifies that XZ WASM regeneration leaves the checked-in binary
+unchanged, checks Worker packaging with `wrangler deploy --dry-run`, and runs the
+isolated Chromium OAuth regression. Actions are pinned to commit hashes and have
+read-only repository permissions. No Cloudflare token or production secret is
+required, and the workflow never deploys a Worker.
+
+To run the additional 1 GiB tests in GitHub, select **Actions → CI → Run workflow**
+and enable the stress-test input. These synthetic checks cover backpressure and
+bounded queues; they are not a production Workers load test.
+
+### Local token-mode server
+
+Start a token-mode local Worker over HTTP:
 
 ```sh
 npm run dev
 ```
 
-The automated suite covers route authentication, signed URLs, stream transforms, ZIP/TAR and compression adapters, multipart manifests, sequential distribution, cancellation, target edge cases, bounded decoder behavior, a default 200-entry/200-target case, and the opt-in synthetic 1 GiB raw/transfer cases. The synthetic tests validate pull/backpressure bounds without allocating a 1 GiB fixture. Before relying on production-scale workloads, also test controlled network source and sink services on the intended Workers plan while observing memory, CPU, wall-time, disconnect, and timeout behavior.
+### Local OAuth over HTTPS
+
+OAuth mode requires HTTPS even on localhost. In `.dev.vars`, set `MCP_AUTH_MODE=oauth`, uncomment the OAuth variables, replace the signing-secret and login-password placeholders with independent random values, and use this resource URL:
+
+```dotenv
+MCP_OAUTH_RESOURCE=https://localhost:8787/mcp
+```
+
+Start the local HTTPS listener explicitly:
+
+```sh
+npm run dev -- --local-protocol https --ip localhost --port 8787
+```
+
+Use that exact hostname and port for every OAuth request; `127.0.0.1` is a different origin. Wrangler supplies a local development certificate. The browser regression accepts a self-signed certificate only for loopback hosts; do not disable certificate validation against deployed Workers. Export the same OAuth values to the test process without printing or committing them. A local callback used by the regression is intercepted inside Chromium, so the test does not contact or reconnect a real ChatGPT account.
+
+ChatGPT cannot reach this localhost listener directly. Register a deployed public HTTPS endpoint using the [ChatGPT setup](#oauth-and-chatgpt-registration) above.
 
 ## Deploy to Cloudflare Workers
 
@@ -581,7 +638,30 @@ The deployment is one Worker named `stateless-stream-gateway-mcp` and has no sto
 
    Updating either secret creates a new Worker version; normal later deployments preserve existing secrets.
 
-   Token mode is the default and needs no additional variables. For OAuth mode, set `MCP_AUTH_MODE=oauth`, the exact `MCP_OAUTH_RESOURCE`, an independent `MCP_OAUTH_SIGNING_SECRET`, the owner login username/password, and `MCP_OAUTH_ALLOWED_REDIRECT_URIS`. Read/write scopes and the access-token lifetime are optional. These values are deployment-specific and intentionally absent from `wrangler.jsonc`; set them through Wrangler or the Cloudflare dashboard rather than committing one operator's credentials.
+   Token mode is the default and needs no additional variables. For OAuth mode, store **each** deployment-specific setting as a Worker secret, including non-sensitive settings, so later `wrangler deploy` commands preserve them:
+
+   ```sh
+   npx wrangler secret put MCP_AUTH_MODE
+   npx wrangler secret put MCP_OAUTH_RESOURCE
+   npx wrangler secret put MCP_OAUTH_SIGNING_SECRET
+   npx wrangler secret put MCP_OAUTH_LOGIN_USERNAME
+   npx wrangler secret put MCP_OAUTH_LOGIN_PASSWORD
+   npx wrangler secret put MCP_OAUTH_ALLOWED_REDIRECT_URIS
+   ```
+
+   At the prompts, enter `oauth`, the exact deployed HTTPS URL including `/mcp`, an independent random signing secret, your chosen owner username and strong password, and the comma-separated exact callback URI allowlist. Do not reuse the REST API token as an OAuth secret or password. No external identity-provider account is required.
+
+   Optional overrides use the same mechanism:
+
+   ```sh
+   npx wrangler secret put MCP_OAUTH_READ_SCOPES
+   npx wrangler secret put MCP_OAUTH_WRITE_SCOPES
+   npx wrangler secret put MCP_OAUTH_ACCESS_TOKEN_TTL_SECONDS
+   ```
+
+   Omit these overrides to keep `streamr.read`, `streamr.write`, and the 12-hour lifetime. For a private deployment that intentionally accepts the longer token-exposure window, `2592000` sets a 30-day lifetime. There are no refresh tokens; authorization is required again after expiry.
+
+   These settings are intentionally absent from `wrangler.jsonc`. In the Cloudflare dashboard, use type **Secret**, not a plaintext variable, for the setup above. If you deliberately manage non-sensitive settings as ordinary dashboard variables instead, use `npm run deploy -- --keep-vars` on every deploy or explicitly configure `keep_vars`; Wrangler otherwise replaces dashboard variables from local configuration. Passwords and signing keys must remain secrets. See Cloudflare's [deployment flag documentation](https://developers.cloudflare.com/workers/wrangler/commands/workers/) and [secret configuration](https://developers.cloudflare.com/workers/configuration/secrets/).
 
 4. Record the HTTPS URL printed by Wrangler and run smoke checks:
 
@@ -616,3 +696,13 @@ The deployment is one Worker named `stateless-stream-gateway-mcp` and has no sto
 5. In token mode, connect an MCP client or MCP Inspector to `$STREAMR_URL/mcp` using Streamable HTTP and the custom header `Authorization: Bearer <token>`. In OAuth mode, use MCP Inspector's OAuth flow and verify metadata discovery, PKCE login, code exchange, and scope enforcement before registering ChatGPT. Invoke `probe_url`, then invoke `create_stream_url` for a small public source and fetch the returned URL before its ten-minute expiry.
 
 For a transfer/distribution smoke test, use a dedicated disposable target endpoint. External writes are non-atomic and are not rolled back or retried by the gateway.
+
+## License
+
+Streamr's original code is available under the [MIT License](LICENSE).
+Third-party code, the bundled XZ WASM module, and modified dependencies retain
+their respective licenses. Attribution, exact versions, local modifications, and
+redistributed license texts are documented in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
+and [LICENSES](LICENSES/). The `private: true` package setting prevents accidental
+npm publication; it does not restrict use under the license or the visibility
+of this GitHub repository.

@@ -5,7 +5,9 @@ MCP_AUTH_MODE=token
 # OAuth mode protects only /mcp; /v1/* continues to use MCP_API_TOKEN.
 # OAuth is self-hosted by the same Worker; no external identity provider is required.
 # Uncomment and replace these values after setting MCP_AUTH_MODE=oauth.
-# MCP_OAUTH_RESOURCE=https://streamr.example.com/mcp
+# Local OAuth requires: npm run dev -- --local-protocol https --ip localhost --port 8787
+# For deployment, replace localhost with the exact public HTTPS Worker origin.
+# MCP_OAUTH_RESOURCE=https://localhost:8787/mcp
 # MCP_OAUTH_SIGNING_SECRET=replace-with-at-least-32-random-bytes
 # MCP_OAUTH_LOGIN_USERNAME=streamr-owner
 # MCP_OAUTH_LOGIN_PASSWORD=replace-with-a-strong-random-password

@@ -1,4 +1,5 @@
 node_modules/
+.venv/
 .dev.vars
 .streamr-production.env
 .streamr-oauth-production.env
