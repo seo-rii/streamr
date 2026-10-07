@@ -515,6 +515,12 @@ npm run check
 
 This command does not run the standalone Chromium OAuth regression or the two opt-in 1 GiB stress cases. Those checks are described separately below.
 
+Worker secret types are maintained in `src/env.d.ts` and `src/oauth.ts`;
+`worker-configuration.d.ts` contains only generated Workers runtime types.
+Use `npm run types` after updating Wrangler or the compatibility settings.
+Type checks do not depend on `.dev.vars`, so they also run in a clean checkout
+without deployment credentials.
+
 Useful narrower commands are:
 
 ```sh
