@@ -172,6 +172,7 @@ export async function uploadByteStream(
   let requestBodySettled = false;
   let countedTerminated = false;
   let countedController: ReadableStreamDefaultController<Uint8Array> | undefined;
+  let fixedLengthPump: Promise<void> | undefined;
   let resolveUpload: (() => void) | undefined;
   let rejectUpload: ((reason: unknown) => void) | undefined;
   const sourceCompletion = new Promise<void>((resolve, reject) => {
@@ -207,18 +208,25 @@ export async function uploadByteStream(
 
     requestBodyState = "cancelling";
     failUpload(reason);
-    requestAbort.abort(reason);
-    if (!countedTerminated) {
-      countedTerminated = true;
-      try {
-        countedController?.error(reason);
-      } catch {
-        // A simultaneous fetch-side cancellation may already own termination.
-      }
-    }
 
-    cancelUploadPromise = (async () => {
+    // Publish the shared promise before aborting: pipeTo can synchronously
+    // reenter this function through the counted stream's cancel callback.
+    cancelUploadPromise = Promise.resolve().then(async () => {
       try {
+        if (!countedTerminated) {
+          countedTerminated = true;
+          // The fixed-length pipe owns its reader's termination through the
+          // abort signal. Also erroring that stream can leave an unhandled
+          // native workerd rejection when the target fails before reading.
+          if (fixedLengthPump === undefined) {
+            try {
+              countedController?.error(reason);
+            } catch {
+              // Fetch-side cancellation may already own termination.
+            }
+          }
+        }
+        requestAbort.abort(reason);
         if (options.cancellation?.mode === "abort") {
           try {
             options.cancellation.abort(reason);
@@ -236,7 +244,7 @@ export async function uploadByteStream(
         requestBodyState = "cancelled";
         releaseSourceReader();
       }
-    })();
+    });
     return cancelUploadPromise;
   };
 
@@ -275,7 +283,6 @@ export async function uploadByteStream(
   );
 
   let body: ReadableStream<Uint8Array> = counted;
-  let fixedLengthPump: Promise<void> | undefined;
   if (byteStream.knownLength !== undefined) {
     const fixed = new FixedLengthStream(byteStream.knownLength);
     fixedLengthPump = counted.pipeTo(fixed.writable, {
