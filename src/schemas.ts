@@ -12,8 +12,9 @@ const pathSchema = z
     message: `Archive paths must be at most ${LIMITS.pathBytes} UTF-8 bytes.`,
   });
 
-export const sourceSchema = z
+export const httpSourceSchema = z
   .object({
+    type: z.literal("http").optional(),
     url: z.string().min(1).max(16_384),
     headers: headersSchema.optional(),
     redirect: z
@@ -76,6 +77,19 @@ const encodedDataSchema = {
   encoding: z.enum(["utf8", "base64"]),
   data: z.string(),
 };
+
+export const inlineSourceSchema = z
+  .object({
+    type: z.literal("inline"),
+    ...encodedDataSchema,
+    data: z.string().max(LIMITS.controlRequestBytes)
+      .describe("UTF-8 text or standard Base64 bytes; at most 4 MiB decoded, within an 8 MiB JSON request."),
+    contentType: z.string().min(1).max(1_024).optional(),
+    filename: z.string().min(1).max(1_024).optional(),
+  })
+  .strict();
+
+export const sourceSchema = z.union([httpSourceSchema, inlineSourceSchema]);
 
 const prependTransformSchema = z
   .object({ type: z.literal("prepend"), ...encodedDataSchema })
@@ -252,6 +266,8 @@ export const distributeRequestSchema = z
   .strict();
 
 export type SourceSpec = z.infer<typeof sourceSchema>;
+export type HttpSourceSpec = z.infer<typeof httpSourceSchema>;
+export type InlineSourceSpec = z.infer<typeof inlineSourceSchema>;
 export type ProbeRequest = z.infer<typeof probeRequestSchema>;
 export type ListRequest = z.infer<typeof listRequestSchema>;
 export type EntrySelector = z.infer<typeof entrySelectorSchema>;

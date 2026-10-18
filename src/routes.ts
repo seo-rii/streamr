@@ -23,6 +23,7 @@ import {
   type DistributeRequest,
   type ListRequest,
   type ProbeRequest,
+  type SourceSpec,
   type StreamRequest,
   type TransferRequest,
   distributeRequestSchema,
@@ -32,8 +33,8 @@ import {
   streamRequestSchema,
   transferRequestSchema,
 } from "./schemas";
-import { fetchSource } from "./source/fetch";
-import type { FetchedSource } from "./source/fetch";
+import { createInlineByteStream } from "./source/inline";
+import { openSource, sourceDetectionHints } from "./source/open";
 import { probeSource } from "./source/probe";
 import type { ByteStream } from "./streams/byte-stream";
 import {
@@ -64,11 +65,8 @@ const AUTHENTICATED_POST_ROUTES = new Set([
   "/v1/distribute",
 ]);
 
-function detectionHints(source: FetchedSource) {
-  return {
-    url: source.finalUrl,
-    ...(source.contentType === undefined ? {} : { contentType: source.contentType }),
-  };
+function sourceUrl(source: SourceSpec): string | undefined {
+  return source.type === "inline" ? undefined : source.url;
 }
 
 async function transformEntry(
@@ -159,7 +157,7 @@ async function executeProbe(
   signal: AbortSignal,
   log?: RequestLogContext,
 ) {
-  log?.setSource(input.source.url);
+  log?.setSource(sourceUrl(input.source));
   const result = await probeSource(input.source, signal, (source) => log?.observeSource(source));
   log?.patch({ archiveFormat: result.detected.format });
   log?.markResult("ok");
@@ -171,13 +169,13 @@ async function executeList(
   signal: AbortSignal,
   log?: RequestLogContext,
 ) {
-  log?.setSource(input.source.url);
-  const source = await fetchSource(input.source, signal);
+  log?.setSource(sourceUrl(input.source));
+  const source = await openSource(input.source, signal);
   log?.observeSource(source);
   try {
     const archive = await openArchive(
       source.byteStream,
-      detectionHints(source),
+      sourceDetectionHints(source),
       { listMode: true },
     );
     const listed = await listOpenedArchive(archive, input.options.maxEntries);
@@ -203,8 +201,8 @@ async function executeStream(
   log?: RequestLogContext,
 ): Promise<Response> {
   validateStreamPipeline(input);
-  log?.setSource(input.source.url);
-  const source = await fetchSource(input.source, signal);
+  log?.setSource(sourceUrl(input.source));
+  const source = await openSource(input.source, signal);
   log?.observeSource(source);
   try {
     if (input.archive === undefined) {
@@ -220,7 +218,7 @@ async function executeStream(
 
     const archive = await openArchive(
       source.byteStream,
-      detectionHints(source),
+      sourceDetectionHints(source),
       { occurrencePaths: selectorOccurrencePaths(input.archive.entries) },
     );
     log?.patch({ archiveFormat: archive.format });
@@ -285,8 +283,8 @@ async function executeTransfer(
       );
     }
   }
-  log?.setSource(input.source.url);
-  const source = await fetchSource(input.source, signal);
+  log?.setSource(sourceUrl(input.source));
+  const source = await openSource(input.source, signal);
   log?.observeSource(source);
 
   try {
@@ -294,7 +292,7 @@ async function executeTransfer(
     if (input.archive !== undefined) {
       const archive = await openArchive(
         source.byteStream,
-        detectionHints(source),
+        sourceDetectionHints(source),
         { occurrencePaths: selectorOccurrencePaths(input.archive.entries) },
       );
       log?.patch({ archiveFormat: archive.format });
@@ -325,13 +323,13 @@ async function executeDistribute(
   log?: RequestLogContext,
 ) {
   validateDistributionRoutes(input.routes);
-  log?.setSource(input.source.url);
-  const source = await fetchSource(input.source, signal);
+  log?.setSource(sourceUrl(input.source));
+  const source = await openSource(input.source, signal);
   log?.observeSource(source);
   try {
     const archive = await openArchive(
       source.byteStream,
-      detectionHints(source),
+      sourceDetectionHints(source),
       { occurrencePaths: selectorOccurrencePaths(input.routes) },
     );
     const result = await distributeArchive(
@@ -370,25 +368,29 @@ export function createGatewayOperations(
 ): GatewayOperations {
   return {
     probeUrl: (input, signal) =>
-      runGatewayOperation(log, "probe_url", input.source.url, () =>
+      runGatewayOperation(log, "probe_url", sourceUrl(input.source), () =>
         executeProbe(input, signal, log),
       ),
     listArchive: (input, signal) =>
-      runGatewayOperation(log, "list_archive", input.source.url, () =>
+      runGatewayOperation(log, "list_archive", sourceUrl(input.source), () =>
         executeList(input, signal, log),
       ),
     createStreamUrl: (input) =>
-      runGatewayOperation(log, "create_stream_url", input.source.url, async () => {
+      runGatewayOperation(log, "create_stream_url", sourceUrl(input.source), async () => {
         validateStreamPipeline(input);
         const signed = await createSignedStreamUrl(origin, input, env.URL_SIGNING_SECRET);
+        if (input.source.type === "inline") {
+          const source = createInlineByteStream(input.source);
+          await source.stream.cancel("inline source validation complete");
+        }
         return { ok: true, ...signed };
       }),
     transfer: (input, signal) =>
-      runGatewayOperation(log, "transfer", input.source.url, () =>
+      runGatewayOperation(log, "transfer", sourceUrl(input.source), () =>
         executeTransfer(input, signal, log),
       ),
     distributeArchive: (input, signal) =>
-      runGatewayOperation(log, "distribute_archive", input.source.url, () =>
+      runGatewayOperation(log, "distribute_archive", sourceUrl(input.source), () =>
         executeDistribute(input, signal, log),
       ),
   };
@@ -397,11 +399,11 @@ export function createGatewayOperations(
 async function runGatewayOperation<T extends object>(
   log: RequestLogContext | undefined,
   operation: string,
-  sourceUrl: string,
+  sourceUrl: string | undefined,
   run: () => Promise<T>,
 ): Promise<T> {
   log?.setOperation(operation);
-  log?.setSource(sourceUrl);
+  if (sourceUrl !== undefined) log?.setSource(sourceUrl);
   try {
     const result = await run();
     log?.markResult("ok");

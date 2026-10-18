@@ -1,6 +1,6 @@
 import { SENSITIVE_REDIRECT_HEADERS } from "../constants";
 import { GatewayError } from "../errors";
-import type { SourceSpec } from "../schemas";
+import type { HttpSourceSpec } from "../schemas";
 import { createTimedAbort } from "../streams/abort";
 import type { ByteStream } from "../streams/byte-stream";
 import { wrapCancellableStream } from "../streams/byte-stream";
@@ -62,7 +62,7 @@ export function parseHttpUrl(value: string, stage: string): URL {
 }
 
 export async function fetchSource(
-  spec: SourceSpec,
+  spec: HttpSourceSpec,
   parentSignal?: AbortSignal,
 ): Promise<FetchedSource> {
   let url = parseHttpUrl(spec.url, "source-validate");

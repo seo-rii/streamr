@@ -76,6 +76,165 @@ describe("stateless MCP server", () => {
           }),
         ]),
       );
+      expect(tools.find((tool) => tool.name === "transfer")).toMatchObject({
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: true,
+          idempotentHint: false,
+          openWorldHint: true,
+        },
+      });
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it.each([
+    {
+      type: "inline",
+      encoding: "utf8",
+      data: "안녕하세요\n",
+      contentType: "text/plain; charset=utf-8",
+      filename: "greeting.txt",
+    },
+    {
+      type: "inline",
+      encoding: "base64",
+      data: "AAH+/w==",
+      contentType: "application/octet-stream",
+      filename: "data.bin",
+    },
+  ])("transfers inline $encoding sources with metadata and transforms", async (source) => {
+    let receivedSignal: AbortSignal | undefined;
+    const value = { ok: true, target: { status: 201 } };
+    const operations = gatewayOperations({
+      transfer: vi.fn(async (_input, signal) => {
+        receivedSignal = signal;
+        expect(signal.aborted).toBe(false);
+        return value;
+      }),
+    });
+    const server = createServer(operations);
+    const [clientTransport, serverTransport] =
+      (await import("@modelcontextprotocol/server")).InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: "inline-transfer-client", version: "1.0.0" });
+    const entryTransforms = [{ type: "append", encoding: "utf8", data: "\n" }];
+    const target = { url: "https://target.test/content", method: "PUT" };
+
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    try {
+      const result = await client.callTool({
+        name: "transfer",
+        arguments: { source, entryTransforms, target },
+      });
+
+      expect(result.isError).not.toBe(true);
+      expect(result.structuredContent).toEqual(value);
+      expect(jsonResult(result)).toEqual(value);
+      expect(operations.transfer).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({
+          source,
+          entryTransforms,
+          target: expect.objectContaining(target),
+        }),
+        receivedSignal,
+      );
+      expect(receivedSignal).toBeInstanceOf(AbortSignal);
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it.each(["probe_url", "list_archive", "create_stream_url", "distribute_archive"] as const)(
+    "accepts an inline archive source in %s",
+    async (toolName) => {
+      const operations = gatewayOperations();
+      const server = createServer(operations);
+      const [clientTransport, serverTransport] =
+        (await import("@modelcontextprotocol/server")).InMemoryTransport.createLinkedPair();
+      const client = new Client({ name: "inline-source-client", version: "1.0.0" });
+      const source = {
+        type: "inline",
+        encoding: "base64",
+        data: "UEsFBgAAAAAAAAAAAAAAAAAAAAAAAA==",
+        contentType: "application/zip",
+        filename: "empty.zip",
+      };
+      const operationNames = {
+        probe_url: "probeUrl",
+        list_archive: "listArchive",
+        create_stream_url: "createStreamUrl",
+        distribute_archive: "distributeArchive",
+      } as const;
+
+      await server.connect(serverTransport);
+      await client.connect(clientTransport);
+      try {
+        const result = await client.callTool({
+          name: toolName,
+          arguments: {
+            source,
+            ...(toolName === "distribute_archive"
+              ? {
+                  routes: [{
+                    path: "optional.txt",
+                    required: false,
+                    target: { url: "https://target.test/content", method: "PUT" },
+                  }],
+                }
+              : {}),
+          },
+        });
+
+        expect(result.isError).not.toBe(true);
+        expect(result.structuredContent).toEqual({ ok: true, operation: toolName });
+        expect(operations[operationNames[toolName]]).toHaveBeenCalledExactlyOnceWith(
+          expect.objectContaining({ source }),
+          expect.any(AbortSignal),
+        );
+      } finally {
+        await client.close();
+        await server.close();
+      }
+    },
+  );
+
+  it("rejects invalid inline transfer arguments before invoking the operation", async () => {
+    const operations = gatewayOperations();
+    const server = createServer(operations);
+    const [clientTransport, serverTransport] =
+      (await import("@modelcontextprotocol/server")).InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: "inline-validation-client", version: "1.0.0" });
+    const source = { type: "inline", encoding: "utf8", data: "hello" };
+    const target = { url: "https://target.test/content", method: "PUT" };
+    const invalidArguments = [
+      { target },
+      { source: { encoding: "utf8", data: "hello" }, target },
+      { source: { type: "inline", data: "hello" }, target },
+      { source: { type: "inline", encoding: "hex", data: "00" }, target },
+      { source: { type: "inline", encoding: "utf8", data: 42 }, target },
+      { source, target: { ...target, method: "GET" } },
+      { source: { ...source, url: "https://source.test/content" }, target },
+      { source: { ...source, type: "http" }, target },
+    ];
+
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    try {
+      for (const arguments_ of invalidArguments) {
+        const result = await client.callTool({ name: "transfer", arguments: arguments_ });
+        expect(result.isError).toBe(true);
+        expect(result.content).toEqual([
+          expect.objectContaining({
+            type: "text",
+            text: expect.stringContaining("Invalid arguments for tool transfer"),
+          }),
+        ]);
+      }
+      expect(operations.transfer).not.toHaveBeenCalled();
     } finally {
       await client.close();
       await server.close();
@@ -138,6 +297,7 @@ describe("stateless MCP server", () => {
 
   it("advertises OAuth schemes and returns a scope challenge before an operation", async () => {
     const operations = gatewayOperations();
+    let grantedScopes = ["streamr.read"];
     const resourceMetadataUrl =
       "https://gateway.test/.well-known/oauth-protected-resource/mcp";
     const handler = createGatewayMcpHandler(operations, {
@@ -159,7 +319,7 @@ describe("stateless MCP server", () => {
             authInfo: {
               token: "test-token",
               clientId: "test-client",
-              scopes: ["streamr.read"],
+              scopes: grantedScopes,
               expiresAt: Math.floor(Date.now() / 1000) + 60,
             },
           });
@@ -181,6 +341,11 @@ describe("stateless MCP server", () => {
       expect(tools.find((tool) => tool.name === "probe_url")).toMatchObject({
         _meta: {
           securitySchemes: [{ type: "oauth2", scopes: ["streamr.read"] }],
+        },
+      });
+      expect(tools.find((tool) => tool.name === "transfer")).toMatchObject({
+        _meta: {
+          securitySchemes: [{ type: "oauth2", scopes: ["streamr.write"] }],
         },
       });
       const toolsWireResult = wireMessages.find((message) => {
@@ -227,6 +392,27 @@ describe("stateless MCP server", () => {
         ],
       });
       expect(operations.transfer).not.toHaveBeenCalled();
+
+      const inlineTransferArguments = {
+        source: { type: "inline", encoding: "utf8", data: "hello" },
+        target: { url: "https://target.test/content", method: "PUT" },
+      };
+      const deniedTransfer = await client.callTool({
+        name: "transfer",
+        arguments: inlineTransferArguments,
+      });
+      expect(deniedTransfer.isError).toBe(true);
+      expect(deniedTransfer._meta).toEqual(result._meta);
+      expect(operations.transfer).not.toHaveBeenCalled();
+
+      grantedScopes = ["streamr.write"];
+      const allowedTransfer = await client.callTool({
+        name: "transfer",
+        arguments: inlineTransferArguments,
+      });
+      expect(allowedTransfer.isError).not.toBe(true);
+      expect(allowedTransfer.structuredContent).toEqual({ ok: true, operation: "transfer" });
+      expect(operations.transfer).toHaveBeenCalledOnce();
     } finally {
       await client.close();
     }
@@ -311,7 +497,7 @@ describe("stateless MCP server", () => {
     expect(operations.probeUrl).not.toHaveBeenCalled();
   });
 
-  it("propagates MCP call cancellation to the injected operation", async () => {
+  it.each(["probe_url", "transfer"])("propagates %s call cancellation to the injected operation", async (toolName) => {
     let markStarted: (() => void) | undefined;
     let markAborted: (() => void) | undefined;
     const started = new Promise<void>((resolve) => {
@@ -320,22 +506,23 @@ describe("stateless MCP server", () => {
     const operationAborted = new Promise<void>((resolve) => {
       markAborted = resolve;
     });
-    const operations = gatewayOperations({
-      probeUrl: vi.fn(
-        (_input, signal) =>
-          new Promise<never>((_resolve, reject) => {
-            markStarted?.();
-            signal.addEventListener(
-              "abort",
-              () => {
-                markAborted?.();
-                reject(signal.reason);
-              },
-              { once: true },
-            );
-          }),
-      ),
-    });
+    const operation = vi.fn(
+      (_input: unknown, signal: AbortSignal) =>
+        new Promise<never>((_resolve, reject) => {
+          markStarted?.();
+          signal.addEventListener(
+            "abort",
+            () => {
+              markAborted?.();
+              reject(signal.reason);
+            },
+            { once: true },
+          );
+        }),
+    );
+    const operations = gatewayOperations(
+      toolName === "transfer" ? { transfer: operation } : { probeUrl: operation },
+    );
     const server = createServer(operations);
     const [clientTransport, serverTransport] =
       (await import("@modelcontextprotocol/server")).InMemoryTransport.createLinkedPair();
@@ -347,8 +534,13 @@ describe("stateless MCP server", () => {
     try {
       const pendingCall = client.callTool(
         {
-          name: "probe_url",
-          arguments: { source: { url: "https://source.test/archive.zip" } },
+          name: toolName,
+          arguments: toolName === "transfer"
+            ? {
+                source: { type: "inline", encoding: "utf8", data: "hello" },
+                target: { url: "https://target.test/content", method: "PUT" },
+              }
+            : { source: { url: "https://source.test/archive.zip" } },
         },
         { signal: controller.signal },
       );

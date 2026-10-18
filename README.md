@@ -1,19 +1,20 @@
 # streamr
 
-`streamr` is an open-source, stateless, bounded-memory HTTP stream gateway and MCP server for Cloudflare Workers. Version 0.2 downloads one HTTP/HTTPS source per operation, optionally scans an archive in source order, applies predefined transforms, and either streams the result to the caller or uploads selected entries to HTTP targets. Optional image transforms decode and encode JPEG, PNG, and WebP inside the Worker using bundled WASM codecs.
+`streamr` is an open-source, stateless, bounded-memory HTTP stream gateway and MCP server for Cloudflare Workers. Version 0.2 reads one HTTP/HTTPS or inline source per operation, optionally scans an archive in source order, applies predefined transforms, and either streams the result to the caller or uploads selected entries to HTTP targets. Inline sources accept UTF-8 text or base64-encoded binary. Optional image transforms decode and encode JPEG, PNG, and WebP inside the Worker using bundled WASM codecs.
 
 Streamr's original code is [MIT-licensed](LICENSE). Bundled components and dependency patches retain their own licenses; see [third-party notices](THIRD_PARTY_NOTICES.md).
 
-The Worker has no R2, KV, D1, Durable Objects, Queues, Containers, cache, jobs, or cross-request session state. Every `probe`, `list`, `stream`, `transfer`, or `distribute` request starts a new source download and discards all request state when it ends.
+The Worker has no R2, KV, D1, Durable Objects, Queues, Containers, cache, jobs, or cross-request session state. Every `probe`, `list`, `stream`, `transfer`, or `distribute` request opens a fresh HTTP or inline source. All request state is discarded when the request ends; uploaded bytes are stored only if the external target stores them.
 
 ## Streaming model
 
-- Normal byte transforms never buffer source archives or extracted entries in full. Payload memory consists of decoder state, bounded input batches, and bounded output queues; metadata grows with the number of listed or selected entries.
+- For HTTP sources, normal byte transforms never buffer source archives or extracted entries in full. Payload memory consists of decoder state, bounded input batches, and bounded output queues; metadata grows with the number of listed or selected entries.
+- Inline sources buffer their bounded JSON content and decoded bytes, with a 4 MiB decoded-content limit. Archive parsing and transforms then use the same streaming pipeline as HTTP sources.
 - The opt-in `image` transform is a bounded-buffer exception: it retains one image's encoded input, decoded pixels, and encoded output within explicit [image limits](#image-conversion). It never buffers the containing archive or every selected image together.
 - ZIP and TAR-family archives are scanned once, in archive order. Request order never reorders the output.
 - Only one archive entry and, for distribution, one target upload are active at a time. A slow client or target propagates backpressure to the entry decoder and source fetch.
 - Each discovered entry is opened or skipped before the next entry advances. Once every requested entry is complete, the remaining source may be cancelled early.
-- A source URL is fetched again for every operation. Calling `list_archive` and then `distribute_archive` therefore performs two independent downloads.
+- An HTTP source is fetched again for every operation. Calling `list_archive` and then `distribute_archive` with the same URL therefore performs two independent downloads.
 
 This is deliberately an SSRF-capable personal gateway: there is no hostname allowlist. Only trusted callers should receive the API token or a signed URL.
 
@@ -22,10 +23,10 @@ This is deliberately an SSRF-capable personal gateway: there is no hostname allo
 | Method | Path | Authentication | Purpose |
 | --- | --- | --- | --- |
 | `POST` | `/mcp` | Configurable Bearer token or OAuth authorization code + PKCE | Stateless MCP Streamable HTTP endpoint |
-| `POST` | `/v1/probe` | Bearer token | Fetch a bounded prefix and detect the source format |
+| `POST` | `/v1/probe` | Bearer token | Inspect a bounded prefix and detect the source format |
 | `POST` | `/v1/list` | Bearer token | List archive entries in archive order |
 | `POST` | `/v1/stream` | Bearer token | Stream a raw source, one entry, or `multipart/mixed` |
-| `GET` | `/v1/stream?p=...&e=...&s=...` | HMAC capability URL | Run a small public-source stream pipeline |
+| `GET` | `/v1/stream?p=...&e=...&s=...` | HMAC capability URL | Run a small HTTP or inline stream pipeline |
 | `POST` | `/v1/transfer` | Bearer token | Send one source or one entry to one target |
 | `POST` | `/v1/distribute` | Bearer token | Send archive entries sequentially to independent targets |
 | `GET` | `/.well-known/oauth-protected-resource` | None | OAuth protected-resource metadata in OAuth mode |
@@ -77,7 +78,7 @@ Access tokens can be configured for up to 30 days for private deployments that p
 
 Only `http:` and `https:` URLs with DNS hostnames are accepted. URL credentials, IP literals, `file:`, `data:`, FTP, and WebSocket URLs are rejected. User-supplied header names and values are checked for CR/LF injection; hop-by-hop headers and caller-supplied `Content-Length` are forbidden.
 
-Source redirects are followed manually, up to five by default. `Authorization`, `Cookie`, and `Proxy-Authorization` are removed when the origin changes unless `forwardSensitiveHeadersAcrossHosts` is explicitly enabled. Target redirects are never followed.
+HTTP source redirects are followed manually, up to five by default. `Authorization`, `Cookie`, and `Proxy-Authorization` are removed when the origin changes unless `forwardSensitiveHeadersAcrossHosts` is explicitly enabled. Target redirects are never followed.
 
 ## HTTP API examples
 
@@ -87,6 +88,17 @@ For local examples, start `npm run dev` and set:
 export STREAMR_URL=http://127.0.0.1:8787
 export STREAMR_TOKEN='the-value-from-.dev.vars'
 ```
+
+### HTTP and inline sources
+
+Every HTTP API pipeline and MCP tool accepts either source form:
+
+- HTTP: `{"source":{"url":"https://files.example/file.bin"}}`. The explicit form `{"source":{"type":"http","url":"https://files.example/file.bin"}}` is also accepted; existing URL requests do not need a `type` field.
+- Inline: `{"source":{"type":"inline","encoding":"utf8","data":"Hello\n"}}`. `encoding` is required and accepts `utf8` or `base64`; `data` is required and may be empty.
+
+Inline sources support the same probing, archive listing and selection, transforms, streaming, and target transfers as HTTP sources. UTF-8 defaults to `text/plain; charset=utf-8`; base64 defaults to `application/octet-stream`. Optional `source.contentType` and `source.filename` provide input metadata. Normal format detection and transforms still apply; explicit `output.contentType` or `target.contentType` overrides the final content type.
+
+Decoded inline content is limited to 4 MiB. The complete JSON request is limited to 8 MiB, including base64 expansion, JSON escaping, and any MCP envelope. For larger files, use an HTTP source. Inline operations make no source HTTP requests (`sourceGets: 0`); where reported, `bytesRead` counts decoded input bytes. Inline probe results include the known `contentLength` and omit HTTP-only `status` and `finalUrl` fields.
 
 ### Probe and list
 
@@ -196,6 +208,69 @@ curl --fail-with-body --silent --show-error \
   }'
 ```
 
+### Upload an inline source
+
+Use `POST /v1/transfer` with an inline source to send text or binary directly to an HTTP target:
+
+```sh
+curl --fail-with-body --silent --show-error \
+  -X POST "$STREAMR_URL/v1/transfer" \
+  -H "Authorization: Bearer $STREAMR_TOKEN" \
+  -H 'Content-Type: application/json' \
+  --data '{
+    "source":{"type":"inline","encoding":"utf8","data":"Hello, streamr!\n"},
+    "target":{"url":"https://upload.example/message","method":"PUT"}
+  }'
+```
+
+To return the content to the caller, send the same `source` to `POST /v1/stream` with `"output":{"mode":"raw"}` in place of `target`. Both operations accept `entryTransforms` as usual.
+
+To upload a local binary file, encode its bytes and construct JSON with Python so filenames and content are escaped correctly:
+
+```sh
+python3 - <<'PY' | curl --fail-with-body --silent --show-error \
+  -X POST "$STREAMR_URL/v1/transfer" \
+  -H "Authorization: Bearer $STREAMR_TOKEN" \
+  -H 'Content-Type: application/json' \
+  --data-binary @-
+import base64
+import json
+from pathlib import Path
+
+path = Path("payload.bin")
+print(json.dumps({
+    "source": {
+        "type": "inline",
+        "encoding": "base64",
+        "data": base64.b64encode(path.read_bytes()).decode("ascii"),
+        "filename": path.name,
+    },
+    "target": {"url": "https://upload.example/file", "method": "PUT"},
+}))
+PY
+```
+
+For a target expecting a file form field, add a final `multipart-form-data` entry transform with its own `fieldName`, `filename`, and `contentType`. Add `archive` selectors to transfer an entry from an inline archive instead of its complete bytes.
+
+A successful text upload above returns the following shape; the captured target response depends on the target:
+
+```json
+{
+  "ok": true,
+  "sourceGets": 0,
+  "bytesRead": 16,
+  "bytesWritten": 16,
+  "targetStatus": 201,
+  "targetResponse": {
+    "contentType": "application/json",
+    "body": "{\"stored\":true}",
+    "truncated": false
+  }
+}
+```
+
+`bytesWritten` counts bytes sent after transforms. Target status validation, response-capture limits, cancellation, and redirect behavior are the same for HTTP and inline sources.
+
 ### Distribute multiple entries
 
 ```sh
@@ -238,7 +313,7 @@ The server exposes exactly five tools:
 | `transfer` | Upload one stream; potentially mutating and non-idempotent |
 | `distribute_archive` | Upload multiple entries; potentially mutating and non-idempotent |
 
-In OAuth mode, every tool publishes a canonical `securitySchemes` declaration and the compatibility `_meta.securitySchemes` mirror. Read tools require `MCP_OAUTH_READ_SCOPES`; target-writing tools require `MCP_OAUTH_WRITE_SCOPES`. A token that is otherwise valid but lacks a required scope receives an OAuth challenge instead of starting a source or target request.
+In OAuth mode, every tool publishes a canonical `securitySchemes` declaration and the compatibility `_meta.securitySchemes` mirror. Read tools require `MCP_OAUTH_READ_SCOPES`; target-writing tools require `MCP_OAUTH_WRITE_SCOPES`. A token that is otherwise valid but lacks a required scope receives an OAuth challenge instead of starting a source or target request. Inline input uses these same tools and scopes.
 
 ### Token-mode MCP client
 
@@ -311,20 +386,22 @@ The structured result has this shape:
 
 There is intentionally no unauthenticated REST endpoint that signs URLs. Only an authenticated MCP caller can invoke `create_stream_url`.
 
+The same tool accepts an [inline source](#http-and-inline-sources). Its content is embedded in the signed URL, with no server-side storage; the complete signed pipeline must fit within 8 KiB and expires after ten minutes.
+
 ## Signed `GET /v1/stream` security
 
 A signed URL is a short-lived bearer capability. Anyone who obtains it can execute its embedded pipeline until expiry.
 
 - The signature is HMAC-SHA256 over `e + "." + p`, using `URL_SIGNING_SECRET`.
 - `p` is canonical base64url-encoded JSON, `e` is a Unix expiry, and `s` is the canonical base64url signature. Missing, duplicate, or extra query parameters are rejected.
-- The decoded JSON payload is limited to 8 KiB and expires after ten minutes. An expiry farther than ten minutes into the future is also rejected.
-- Signed pipelines may contain only HTTP/HTTPS URLs without URL credentials or IP literals.
+- The decoded JSON payload is limited to 8 KiB, including any inline content, and expires after ten minutes. An expiry farther than ten minutes into the future is also rejected.
+- Signed pipelines accept HTTP or inline sources. HTTP sources may contain only HTTP/HTTPS URLs without URL credentials or IP literals.
 - **All custom `headers` are forbidden in a signed payload**, including nonstandard API-key headers. Use authenticated `POST /v1/stream` whenever a source requires headers.
 - Signed stream pipelines cannot perform target uploads; they use the stream request schema only.
-- Query strings can appear in browser history, proxy logs, screenshots, and copied links. Successful stream responses set `Referrer-Policy: no-referrer`, `X-Content-Type-Options: nosniff`, and `Cache-Control: no-store`, but callers must still avoid private source URLs or other secrets in the payload and must not share the capability URL.
+- Query strings can appear in browser history, proxy logs, screenshots, and copied links. Successful stream responses set `Referrer-Policy: no-referrer`, `X-Content-Type-Options: nosniff`, and `Cache-Control: no-store`, but callers must still avoid private source URLs, sensitive inline content, or other secrets in the payload and must not share the capability URL.
 - Rotating `URL_SIGNING_SECRET` invalidates all outstanding URLs. Use a separate high-entropy value from `MCP_API_TOKEN`.
 
-The signature authenticates the pipeline, not the bytes returned by the source. Use TLS and an application-level digest when source integrity matters.
+The signature authenticates the pipeline, including inline content. It does not authenticate bytes returned by an HTTP source. Use TLS and an application-level digest when HTTP source integrity matters.
 
 ## Archive behavior
 
@@ -422,7 +499,7 @@ If all-or-nothing behavior is required, the target service must provide its own 
 
 ## Transforms
 
-Entry transforms run in order and are applied independently to each selected file. Distribution routes can define different transform lists. Final transforms apply after a raw result or the complete multipart envelope has been produced.
+Entry transforms run in order and are applied independently to each selected file or raw source, including inline content. Distribution routes can define different transform lists. Final transforms apply after a raw result or the complete multipart envelope has been produced.
 
 | Transform | Notes |
 | --- | --- |
@@ -440,7 +517,7 @@ Only `limit` and `gzip` are valid final transforms for a raw result. A `multipar
 
 ### Image conversion
 
-Use an `image` entry transform on a raw source or selected archive file. The format changes through actual decoding and encoding, not by renaming the file:
+Use an `image` entry transform on a raw HTTP or inline source, or a selected archive file. The format changes through actual decoding and encoding, not by renaming the file:
 
 ```json
 {
@@ -499,6 +576,7 @@ No Cloudflare Images binding, external image service, native container, or addit
 | Active archive entries / target uploads | 1 each |
 | Archive path | 4,096 UTF-8 bytes |
 | Control-plane JSON body | 8 MiB |
+| Inline source decoded content | 4 MiB |
 | Entry output / total request output | 4 GiB / 16 GiB |
 | Entry or final transform list | 16 transforms; multipart common entry + final total is also 16 |
 | Prepend / append / replace search | 64 KiB each |

@@ -29,9 +29,9 @@ export interface RequestMetrics {
 export interface RequestLogContext {
   readonly requestId: string;
   setOperation(operation: string): void;
-  setSource(url: string): void;
+  setSource(url: string | undefined): void;
   observeSource(source: {
-    finalUrl: string;
+    finalUrl?: string;
     stats: { sourceGets: number; bytesRead: number };
   }): void;
   patch(values: Partial<RequestMetrics>): void;
@@ -44,11 +44,12 @@ export function requestId(): string {
   return `req_${crypto.randomUUID()}`;
 }
 
-export function safeUrlParts(value: string): {
+export function safeUrlParts(value: string | undefined): {
   scheme: string;
   hostname: string;
   pathname: string;
 } | undefined {
+  if (value === undefined) return undefined;
   try {
     const url = new URL(value);
     return {

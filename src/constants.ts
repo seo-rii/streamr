@@ -16,6 +16,7 @@ export const LIMITS = {
   signedPayloadBytes: 8 * 1024,
   signedUrlTtlSeconds: 10 * 60,
   controlRequestBytes: 8 * 1024 * 1024,
+  inlineSourceBytes: 4 * 1024 * 1024,
   prefixBytes: 512,
   headerCount: 128,
   headerValueBytes: 16 * 1024,

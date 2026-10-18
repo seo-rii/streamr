@@ -182,7 +182,7 @@ export function registerGatewayTools(
     {
       ...toolSecurity(authPolicy, "read"),
       title: "Probe URL",
-      description: "Inspect an HTTP or HTTPS source and detect its stream or archive format.",
+      description: "Inspect an HTTP(S) or inline UTF-8/Base64 source and detect its stream or archive format.",
       inputSchema: probeRequestSchema,
       annotations: {
         readOnlyHint: true,
@@ -202,7 +202,7 @@ export function registerGatewayTools(
     {
       ...toolSecurity(authPolicy, "read"),
       title: "List Archive",
-      description: "Stream an archive once and return entries in archive order.",
+      description: "Stream an archive from an HTTP(S) or inline source once and return entries in archive order.",
       inputSchema: listRequestSchema,
       annotations: {
         readOnlyHint: true,
@@ -222,7 +222,8 @@ export function registerGatewayTools(
     {
       ...toolSecurity(authPolicy, "read"),
       title: "Create Stream URL",
-      description: "Create a short-lived signed URL for a validated streaming pipeline.",
+      description:
+        "Create a short-lived signed URL for a validated pipeline using an HTTP(S) or inline source. Signed payloads are limited to 8 KiB.",
       inputSchema: streamRequestSchema,
       annotations: {
         readOnlyHint: true,
@@ -242,7 +243,8 @@ export function registerGatewayTools(
     {
       ...toolSecurity(authPolicy, "write"),
       title: "Transfer Stream",
-      description: "Stream one source or archive entry to an external HTTP target.",
+      description:
+        "Stream an HTTP(S) or inline UTF-8/Base64 source, or selected archive entry, to an external HTTP target. Inline decoded content is limited to 4 MiB and the complete JSON request to 8 MiB.",
       inputSchema: transferRequestSchema,
       annotations: {
         readOnlyHint: false,
@@ -263,7 +265,7 @@ export function registerGatewayTools(
       ...toolSecurity(authPolicy, "write"),
       title: "Distribute Archive",
       description:
-        "Stream selected archive entries sequentially to independent external HTTP targets.",
+        "Stream selected entries from an HTTP(S) or inline archive sequentially to independent external HTTP targets.",
       inputSchema: distributeRequestSchema,
       annotations: {
         readOnlyHint: false,
