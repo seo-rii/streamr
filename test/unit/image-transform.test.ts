@@ -35,6 +35,18 @@ async function readBytes(stream: ByteStream): Promise<Uint8Array> {
   return new Uint8Array(await new Response(stream.stream).arrayBuffer());
 }
 
+function trackByteAllocations(): Uint8Array[] {
+  const allocations: Uint8Array[] = [];
+  vi.stubGlobal("Uint8Array", new Proxy(Uint8Array, {
+    construct(target, args) {
+      const bytes = Reflect.construct(target, args) as Uint8Array;
+      if (typeof args[0] === "number") allocations.push(bytes);
+      return bytes;
+    },
+  }));
+  return allocations;
+}
+
 function spec(options: Omit<z.input<typeof imageTransformSchema>, "type">): ImageTransformSpec {
   return imageTransformSchema.parse({ type: "image", ...options });
 }
@@ -157,6 +169,88 @@ describe("bounded Worker-local WASM image transform", () => {
     });
     expect(source.pull).not.toHaveBeenCalled();
     expect(source.abort).toHaveBeenCalled();
+  });
+
+  it.each(["unknown", "zero", "under", "exact", "over"] as const)(
+    "bounds allocations for a small image in one-byte chunks when the length hint is %s",
+    async (hint) => {
+      const png = makePng();
+      const knownLength = hint === "unknown" ? undefined : hint === "zero" ? 0
+        : hint === "under" ? 1 : png.byteLength + (hint === "over" ? 17 : 0);
+      const source = input(Array.from(png, (_, index) => png.subarray(index, index + 1)), knownLength);
+      const allocations = trackByteAllocations();
+      let encoded: Uint8Array;
+      try {
+        encoded = await readBytes(await transformImage(source, spec({ format: "png" })));
+      } finally {
+        vi.unstubAllGlobals();
+      }
+      expect(imageDimensions(encoded)).toEqual({ format: "png", width: 16, height: 8 });
+      expect(pngPixel(encoded, 7, 3)).toEqual(pngPixel(png, 7, 3));
+      // Observe actual backing allocations: small inputs must not reserve 4 MiB.
+      expect(allocations.length).toBeGreaterThan(0);
+      expect(allocations.reduce((total, bytes) => total + bytes.byteLength, 0)).toBeLessThan(256 * 1024);
+      expect(allocations.every((bytes) => bytes.every((byte) => byte === 0))).toBe(true);
+    },
+  );
+
+  it.each([undefined, 1, 1.5 * 1024 * 1024])("caps actual input with length hint %s and clears every grown buffer", async (knownLength) => {
+    const chunk = new Uint8Array(64 * 1024).fill(0x7f);
+    const source = input([
+      ...Array.from({ length: IMAGE_LIMITS.inputBytes / chunk.byteLength }, () => chunk),
+      new Uint8Array([1]),
+      new Uint8Array([2]),
+    ], knownLength);
+    const allocations = trackByteAllocations();
+    try {
+      await expect(transformImage(source, spec({ format: "png" }))).rejects.toMatchObject({
+        code: "IMAGE_LIMIT_EXCEEDED",
+      });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+    expect(source.pull).toHaveBeenCalledTimes(65);
+    expect(source.cancel).toHaveBeenCalled();
+    expect(source.abort).toHaveBeenCalled();
+    expect(allocations.every((bytes) => bytes.byteLength <= IMAGE_LIMITS.inputBytes)).toBe(true);
+    expect(allocations.reduce((total, bytes) => total + bytes.byteLength, 0)).toBeLessThan(2 * IMAGE_LIMITS.inputBytes);
+    expect(allocations.every((bytes) => bytes.every((byte) => byte === 0))).toBe(true);
+    await readBytes(await transformImage(input([makePng()]), spec({ format: "png" })));
+  });
+
+  it("clears populated input buffers and releases admission when a pending read is aborted", async () => {
+    const png = makePng();
+    const controller = new AbortController();
+    const cancel = vi.fn();
+    let reads = 0;
+    let started: (() => void) | undefined;
+    const reading = new Promise<void>((resolve) => { started = resolve; });
+    const source = {
+      stream: new ReadableStream<Uint8Array>({
+        pull(output) {
+          if (reads++ === 0) output.enqueue(png);
+          else started?.();
+        },
+        cancel,
+      }, { highWaterMark: 0 }),
+      knownLength: 1,
+      abort: vi.fn(),
+    };
+    const allocations = trackByteAllocations();
+    try {
+      const transformation = transformImage(source, spec({ format: "png" }), controller.signal);
+      await reading;
+      const rejection = expect(transformation).rejects.toMatchObject({ code: "PIPELINE_ABORTED" });
+      const containedInput = allocations.some((bytes) => bytes.some((byte) => byte !== 0));
+      controller.abort("request disconnected");
+      await rejection;
+      expect(containedInput).toBe(true);
+      expect(allocations.every((bytes) => bytes.every((byte) => byte === 0))).toBe(true);
+      expect(cancel).toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+    await readBytes(await transformImage(input([png]), spec({ format: "png" })));
   });
 
   it("bounds unknown-length input, cancels it, and does not read subsequent chunks", async () => {
