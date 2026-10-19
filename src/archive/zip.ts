@@ -402,7 +402,9 @@ export class ZipAdapter implements ArchiveAdapter {
     let sourceOffset = 0;
     let sourceFinal = false;
     let sourceBytes = 0;
-    let tail = EMPTY;
+    const tail = new Uint8Array(ZIP_TAIL_BYTES);
+    let tailLength = 0;
+    let tailWriteOffset = 0;
     let index = 0;
     let completed = false;
 
@@ -423,13 +425,17 @@ export class ZipAdapter implements ArchiveAdapter {
         centralScanner.push(result.value);
         sourceBytes += result.value.byteLength;
         if (result.value.byteLength >= ZIP_TAIL_BYTES) {
-          tail = result.value.slice(-ZIP_TAIL_BYTES);
+          tail.set(result.value.subarray(-ZIP_TAIL_BYTES));
+          tailLength = ZIP_TAIL_BYTES;
+          tailWriteOffset = 0;
         } else {
-          const keep = Math.min(tail.byteLength, ZIP_TAIL_BYTES - result.value.byteLength);
-          const nextTail = new Uint8Array(keep + result.value.byteLength);
-          nextTail.set(tail.subarray(tail.byteLength - keep));
-          nextTail.set(result.value, keep);
-          tail = nextTail;
+          const firstLength = Math.min(result.value.byteLength, ZIP_TAIL_BYTES - tailWriteOffset);
+          tail.set(result.value.subarray(0, firstLength), tailWriteOffset);
+          if (firstLength < result.value.byteLength) {
+            tail.set(result.value.subarray(firstLength), 0);
+          }
+          tailWriteOffset = (tailWriteOffset + result.value.byteLength) % ZIP_TAIL_BYTES;
+          tailLength = Math.min(tailLength + result.value.byteLength, ZIP_TAIL_BYTES);
         }
         sourceChunk = result.value;
         sourceOffset = 0;
@@ -663,7 +669,15 @@ export class ZipAdapter implements ArchiveAdapter {
         await processing;
         if (processingError !== undefined) throw archiveError(processingError);
       }
-      validateZipTail(tail, sourceBytes, index, centralScanner);
+      // Preserve only the trailing bytes while reading; restore their order once
+      // at EOF instead of copying the retained tail for every source chunk.
+      let orderedTail = tail.subarray(0, tailLength);
+      if (tailLength === ZIP_TAIL_BYTES && tailWriteOffset !== 0) {
+        orderedTail = new Uint8Array(tailLength);
+        orderedTail.set(tail.subarray(tailWriteOffset));
+        orderedTail.set(tail.subarray(0, tailWriteOffset), ZIP_TAIL_BYTES - tailWriteOffset);
+      }
+      validateZipTail(orderedTail, sourceBytes, index, centralScanner);
       completed = true;
     } finally {
       if (!completed) input.abort("ZIP iteration stopped");

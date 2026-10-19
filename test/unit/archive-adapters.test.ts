@@ -423,6 +423,64 @@ describe("ZIP archive adapter", () => {
     await expect(drainArchive(new ZipAdapter(), archive, 64 * 1024)).resolves.toBeUndefined();
   });
 
+  it.each([1024, 4096, 64 * 1024, 132 * 1024, 160 * 1024, 512 * 1024])(
+    "validates a wrapped tail with %i-byte source chunks",
+    async (chunkSize) => {
+      const archive = makeZip([
+        { path: "large.bin", data: new Uint8Array(3 * 132 * 1024 + 257).fill(97) },
+      ]);
+
+      await expect(drainArchive(new ZipAdapter(), archive, chunkSize)).resolves.toBeUndefined();
+    },
+  );
+
+  it.each([-1, 0, 1])("validates EOF %i byte(s) from a complete tail rotation", async (delta) => {
+    const overhead = makeZip([{ path: "aligned.bin" }]).byteLength;
+    const archive = makeZip([
+      { path: "aligned.bin", data: new Uint8Array(2 * 132 * 1024 + delta - overhead) },
+    ]);
+    expect(archive.byteLength).toBe(2 * 132 * 1024 + delta);
+
+    await expect(drainArchive(new ZipAdapter(), archive, 4096)).resolves.toBeUndefined();
+  });
+
+  it.each([false, true])("validates a maximum ZIP comment after tail wrap (ZIP64: %s)", async (zip64) => {
+    const base = makeZip([
+      { path: "large.bin", data: new Uint8Array(3 * 132 * 1024 + 257) },
+    ]);
+    const archive = zip64 ? wrapZip64Eocd(base) : base;
+    const eocd = zipEocdOffset(archive);
+    new DataView(archive.buffer, archive.byteOffset, archive.byteLength).setUint16(eocd + 20, 0xffff, true);
+    const comment = new Uint8Array(0xffff).fill(97);
+    // An EOCD signature inside the comment must not replace the real record.
+    comment.set([0x50, 0x4b, 0x05, 0x06], 32 * 1024);
+
+    await expect(drainArchive(new ZipAdapter(), concat([archive, comment]), 1024)).resolves.toBeUndefined();
+  });
+
+  it.each(["missing-eocd", "central-size", "zip64-locator"] as const)(
+    "rejects a corrupt %s after multiple tail rotations",
+    async (corruption) => {
+      const base = makeZip([
+        { path: "large.bin", data: new Uint8Array(3 * 132 * 1024 + 257) },
+      ]);
+      const archive = corruption === "zip64-locator" ? wrapZip64Eocd(base) : base;
+      const eocd = zipEocdOffset(archive);
+      const view = new DataView(archive.buffer, archive.byteOffset, archive.byteLength);
+      if (corruption === "missing-eocd") {
+        view.setUint32(eocd, 0, true);
+      } else if (corruption === "central-size") {
+        view.setUint32(eocd + 12, 4, true);
+      } else {
+        view.setUint32(eocd - 20, 0, true);
+      }
+
+      await expect(drainArchive(new ZipAdapter(), archive, 4096)).rejects.toMatchObject({
+        code: "CORRUPT_ARCHIVE",
+      });
+    },
+  );
+
   it("preserves ZIP64 EOCD validation for stored and deflated entries", async () => {
     const archive = wrapZip64Eocd(
       makeZip([
