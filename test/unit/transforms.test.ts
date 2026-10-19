@@ -116,6 +116,7 @@ describe("literal replace transform", () => {
   });
 
   it("emits expansion chunks under downstream demand before reading more source data", async () => {
+    const replacement = "expanded".repeat(8192);
     let pulls = 0;
     const source: ByteStream = {
       stream: new ReadableStream<Uint8Array>(
@@ -131,13 +132,13 @@ describe("literal replace transform", () => {
       abort: vi.fn(),
     };
     const transformed = await applyEntryTransforms(source, [
-      { type: "replace", search: "a", replacement: "expanded" },
+      { type: "replace", search: "a", replacement },
     ]);
     const reader = transformed.stream.getReader();
 
-    expect(new TextDecoder().decode((await reader.read()).value)).toBe("expanded");
+    expect(new TextDecoder().decode((await reader.read()).value)).toBe(replacement);
     expect(pulls).toBe(1);
-    expect(new TextDecoder().decode((await reader.read()).value)).toBe("expanded");
+    expect(new TextDecoder().decode((await reader.read()).value)).toBe(replacement);
     expect(pulls).toBe(1);
     await reader.cancel();
   });
