@@ -68,6 +68,9 @@ describe("inline source", () => {
     { data: "AA==", expected: [0] },
     { data: "AP8=", expected: [0, 255] },
     { data: "AAEC", expected: [0, 1, 2] },
+    { data: "\t AP8=\r\n\f ", expected: [0, 255] },
+    { data: "AB==", expected: [0] },
+    { data: "AAB=", expected: [0, 0] },
   ])("decodes padded and unpadded complete Base64 groups ($data)", async ({ data, expected }) => {
     const source = createInlineByteStream({ type: "inline", encoding: "base64", data });
 
@@ -75,6 +78,17 @@ describe("inline source", () => {
     expect(source.contentType).toBe("application/octet-stream");
     expect(new Uint8Array(await new Response(source.stream).arrayBuffer()))
       .toEqual(new Uint8Array(expected));
+  });
+
+  it("preserves every byte value through native Base64 decoding", async () => {
+    const expected = Uint8Array.from({ length: 256 }, (_, index) => index);
+    const source = createInlineByteStream({
+      type: "inline",
+      encoding: "base64",
+      data: btoa(String.fromCharCode(...expected)),
+    });
+
+    expect(new Uint8Array(await new Response(source.stream).arrayBuffer())).toEqual(expected);
   });
 
   it("preserves supplied content metadata", async () => {
@@ -97,7 +111,7 @@ describe("inline source", () => {
     expect((await new Response(source.stream).arrayBuffer()).byteLength).toBe(0);
   });
 
-  it.each(["%%%=", "a", "a===", "AA=A", "=AAA", "AAAA====", "AA-_"])(
+  it.each(["%%%=", "a", "a===", "AA=A", "=AAA", "AAAA====", "AA-_", "AP8", "AP8=\v", "AP8=\u00a0", "AP8=ignored"])(
     "rejects malformed Base64 synchronously (%s)",
     (data) => {
       expect(() => createInlineByteStream({ type: "inline", encoding: "base64", data }))
