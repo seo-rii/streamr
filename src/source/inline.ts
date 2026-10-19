@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer";
 import { LIMITS } from "../constants";
 import { GatewayError } from "../errors";
 import type { InlineSourceSpec } from "../schemas";
@@ -61,8 +62,11 @@ export function createInlineByteStream(
     const padding = compact.endsWith("==") ? 2 : compact.endsWith("=") ? 1 : 0;
     if ((compact.length / 4) * 3 - padding > LIMITS.inlineSourceBytes) tooLarge();
     try {
-      const binary = atob(compact);
-      decoded = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+      // Decode without a binary string or per-character iteration, then expose
+      // a plain Uint8Array view without copying. Keep the stricter validation
+      // above: Buffer also accepts encodings outside this source contract.
+      const buffer = Buffer.from(compact, "base64");
+      decoded = new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
     } catch (error) {
       invalidBase64(error);
     }
