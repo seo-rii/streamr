@@ -69,8 +69,9 @@ export async function transformImage(
     if (input.knownLength !== undefined && input.knownLength > IMAGE_LIMITS.inputBytes) {
       throw imageLimit("The image input exceeds 4 MiB.");
     }
-    // Fixed allocation also bounds metadata for sources that deliver tiny chunks.
-    inputBytes = new Uint8Array(IMAGE_LIMITS.inputBytes);
+    // Length is a capacity hint, never a substitute for counting actual bytes.
+    // Unknown-length sources start small without retaining per-chunk metadata.
+    inputBytes = new Uint8Array(input.knownLength ?? 64 * 1024);
     reader = input.stream.getReader();
     let length = 0;
     while (true) {
@@ -80,8 +81,18 @@ export async function transformImage(
       if (chunk.value.byteLength > IMAGE_LIMITS.inputBytes - length) {
         throw imageLimit("The image input exceeds 4 MiB.");
       }
+      const required = length + chunk.value.byteLength;
+      if (required > inputBytes.byteLength) {
+        // Power-of-two growth bounds total input allocations below 8 MiB,
+        // including when an arbitrary HTTP length hint understates the body.
+        const capacity = Math.min(IMAGE_LIMITS.inputBytes, 2 ** Math.ceil(Math.log2(required)));
+        const grown = new Uint8Array(capacity);
+        grown.set(inputBytes.subarray(0, length));
+        inputBytes.fill(0);
+        inputBytes = grown;
+      }
       inputBytes.set(chunk.value, length);
-      length += chunk.value.byteLength;
+      length = required;
     }
     reader.releaseLock();
     reader = undefined;
