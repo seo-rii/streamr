@@ -207,12 +207,13 @@ async function executeStream(
   try {
     if (input.archive === undefined) {
       const entryOutput = await transformEntry(source.byteStream, input.entryTransforms, false, signal);
-      const finalOutput = await inferByteStreamContentType(
-        limitBytes(
-          await applyFinalTransforms(entryOutput, input.finalTransforms),
-          LIMITS.requestOutputBytes,
-        ),
+      let finalOutput = limitBytes(
+        await applyFinalTransforms(entryOutput, input.finalTransforms),
+        LIMITS.requestOutputBytes,
       );
+      if (input.output.contentType === undefined) {
+        finalOutput = await inferByteStreamContentType(finalOutput);
+      }
       return rawResponse(log === undefined ? finalOutput : observeByteStream(finalOutput, log), input.output);
     }
 
@@ -248,12 +249,13 @@ async function executeStream(
 
     const selected = await selectSingleEntry(archive, input.archive.entries[0]!);
     const entryOutput = await transformEntry(selected.byteStream, input.entryTransforms, false, signal);
-    const finalOutput = await inferByteStreamContentType(
-      limitBytes(
-        await applyFinalTransforms(entryOutput, input.finalTransforms),
-        LIMITS.requestOutputBytes,
-      ),
+    let finalOutput = limitBytes(
+      await applyFinalTransforms(entryOutput, input.finalTransforms),
+      LIMITS.requestOutputBytes,
     );
+    if (input.output.contentType === undefined) {
+      finalOutput = await inferByteStreamContentType(finalOutput);
+    }
     const response = rawResponse(
       log === undefined ? finalOutput : observeByteStream(finalOutput, log),
       input.output,
@@ -301,7 +303,9 @@ async function executeTransfer(
       ).byteStream;
     }
     byteStream = await transformEntry(byteStream, input.entryTransforms, true, signal);
-    byteStream = await inferByteStreamContentType(byteStream);
+    if (input.target.contentType === undefined) {
+      byteStream = await inferByteStreamContentType(byteStream);
+    }
     const result = await uploadByteStream(byteStream, input.target, signal);
     log?.patch({ bytesWritten: result.bytesWritten });
     log?.markResult("ok");
