@@ -1,5 +1,5 @@
 diff --git a/node_modules/fflate/esm/browser.d.ts b/node_modules/fflate/esm/browser.d.ts
-index d430faf..badb950 100644
+index d430faf..c4e7158 100644
 --- a/node_modules/fflate/esm/browser.d.ts
 +++ b/node_modules/fflate/esm/browser.d.ts
 @@ -1425,6 +1425,14 @@ export interface UnzipFile {
@@ -17,11 +17,19 @@ index d430faf..badb950 100644
      /**
       * The compressed size of the file. Will not be present for archives created
       * in a streaming fashion.
+@@ -1439,6 +1447,7 @@ export interface UnzipFile {
+      * Starts reading from the stream. Calling this function will always enable
+      * this stream, but ocassionally the stream will be enabled even without
+      * this being called.
++     * May only be called once per file; repeated calls throw a finished-stream error.
+      */
+     start(): void;
+     /**
 diff --git a/node_modules/fflate/esm/browser.js b/node_modules/fflate/esm/browser.js
-index 82af0fd..817309f 100644
+index 82af0fd..b49f628 100644
 --- a/node_modules/fflate/esm/browser.js
 +++ b/node_modules/fflate/esm/browser.js
-@@ -2455,11 +2455,13 @@ var Unzip = /*#__PURE__*/ (function () {
+@@ -2455,14 +2455,20 @@ var Unzip = /*#__PURE__*/ (function () {
              var l = buf.length, oc = this.c, add = oc && this.d;
              var _loop_2 = function () {
                  var sig = b4(buf, i);
@@ -35,8 +43,21 @@ index 82af0fd..817309f 100644
 +                    var bf = b2(buf, i + 6), cmp_1 = b2(buf, i + 8), u = bf & 2048, dd = bf & 8, crc_1 = b4(buf, i + 14), fnl = b2(buf, i + 26), es = b2(buf, i + 28);
                      if (l > i + 30 + fnl + es) {
                          var chks_3 = [];
-                         this_1.k.unshift(chks_3);
-@@ -2475,6 +2477,10 @@ var Unzip = /*#__PURE__*/ (function () {
+-                        this_1.k.unshift(chks_3);
++                        // Only the current and previous file are indexed while
++                        // parsing descriptors; deferred starts own their cache.
++                        if (this_1.k.length)
++                            this_1.k[1] = this_1.k[0];
++                        this_1.k[0] = chks_3;
+                         f = 2;
+                         var lsc = b4(buf, i + 18), lsu = b4(buf, i + 22);
+                         var fn_1 = strFromU8(buf.subarray(i + 30, i += 30 + fnl), !u);
+@@ -2471,13 +2477,22 @@ var Unzip = /*#__PURE__*/ (function () {
+                             sc_1 = -1 - z64;
+                         i += es;
+                         this_1.c = sc_1;
+-                        var d_1;
++                        var d_1, started_1 = false;
                          var file_1 = {
                              name: fn_1,
                              compression: cmp_1,
@@ -47,7 +68,33 @@ index 82af0fd..817309f 100644
                              start: function () {
                                  if (!file_1.ondata)
                                      err(5);
-@@ -2503,12 +2509,15 @@ var Unzip = /*#__PURE__*/ (function () {
++                                // Cached input is released after replay, so a
++                                // second start cannot safely replay the file.
++                                if (started_1)
++                                    err(4, 'file already started');
++                                started_1 = true;
+                                 if (!sc_1)
+                                     file_1.ondata(null, et, true);
+                                 else {
+@@ -2486,9 +2501,14 @@ var Unzip = /*#__PURE__*/ (function () {
+                                         file_1.ondata(err(14, 'unknown compression type ' + cmp_1, 1), null, false);
+                                     d_1 = sc_1 < 0 ? new ctr(fn_1) : new ctr(fn_1, sc_1, su_1);
+                                     d_1.ondata = function (err, dat, final) { file_1.ondata(err, dat, final); };
+-                                    for (var _i = 0, chks_4 = chks_3; _i < chks_4.length; _i++) {
+-                                        var dat = chks_4[_i];
+-                                        d_1.push(dat, false);
++                                    try {
++                                        for (var _i = 0, chks_4 = chks_3; _i < chks_4.length; _i++) {
++                                            var dat = chks_4[_i];
++                                            d_1.push(dat, false);
++                                        }
++                                    }
++                                    finally {
++                                        chks_3.length = 0;
+                                     }
+                                     if (_this.k[0] == chks_3 && _this.c)
+                                         _this.d = d_1;
+@@ -2503,12 +2523,15 @@ var Unzip = /*#__PURE__*/ (function () {
                          };
                          if (sc_1 >= 0)
                              file_1.size = sc_1, file_1.originalSize = su_1;

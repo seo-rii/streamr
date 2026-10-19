@@ -8,7 +8,7 @@ The patches in `patches/` contain changes to the following packages. The accompa
 
 | Package | Upstream terms | Local changes |
 | --- | --- | --- |
-| [`fflate` 0.8.3](https://github.com/101arrowz/fflate) | [MIT; Copyright (c) 2026 Arjun Barrett](LICENSES/fflate.txt) | Exposes ZIP local-header flags, encryption and data-descriptor indicators, and CRC metadata to the streaming adapter. |
+| [`fflate` 0.8.3](https://github.com/101arrowz/fflate) | [MIT; Copyright (c) 2026 Arjun Barrett](LICENSES/fflate.txt) | Exposes ZIP local-header flags, encryption and data-descriptor indicators, and CRC metadata to the streaming adapter. Releases replayed ZIP input caches and bounds parser bookkeeping. |
 | [`fzstd` 0.1.1](https://github.com/101arrowz/fzstd) | [MIT; Copyright (c) 2020 Arjun Barrett](LICENSES/fzstd.txt) | Caps declared Zstandard windows at **16 MiB** and verifies frame checksums with a streaming XXH64 implementation, including checksums split across input chunks. |
 | [`@modelcontextprotocol/server` 2.0.0](https://github.com/modelcontextprotocol/typescript-sdk) | [Upstream Apache-2.0/MIT transition notice and license texts](LICENSES/modelcontextprotocol-server.txt) | Carries `securitySchemes` through tool registration, updates, and tool-list responses, including the TypeScript declarations. |
 
