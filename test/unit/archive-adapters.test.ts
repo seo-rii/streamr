@@ -275,6 +275,125 @@ describe("ZIP archive adapter", () => {
     ]);
   });
 
+  it.each([25, 4096, 16 * 1024])(
+    "preserves later entries while extracting and skipping mixed files with %i-byte source chunks",
+    async (chunkSize) => {
+      const files = Array.from({ length: 36 }, (_, index) => ({
+        path: index % 5 === 0 ? "same.bin" : index % 5 === 1 ? "./same.bin" : `files/${index}.bin`,
+        data: Uint8Array.from(
+          { length: index % 4 === 0 || index % 7 === 0 ? 0 : 2048 + index * 31 },
+          (_, offset) => (index * 31 + offset * 17 + (offset >> 3)) & 255,
+        ),
+        compression: index % 2 === 0 ? "stored" as const : "deflate" as const,
+      }));
+      const archive = makeZip(files);
+      const input = testByteStream(archive, chunkSize);
+      const occurrences = new Map<string, number>();
+      let visited = 0;
+      for await (const entry of new ZipAdapter().entries(input.byteStream, { listMode: true })) {
+        const expected = files[visited];
+        if (expected === undefined) throw new Error("unexpected extra ZIP entry");
+        const path = normalizeArchivePath(expected.path).path;
+        const occurrence = (occurrences.get(path) ?? 0) + 1;
+        occurrences.set(path, occurrence);
+        expect(entry).toMatchObject({
+          index: visited + 1,
+          path,
+          occurrence,
+          compressionMethod: expected.compression === "stored" ? 0 : 8,
+        });
+        if (visited % 3 === 1) {
+          await entry.skip();
+        } else {
+          const body = await entry.open();
+          await expect(
+            new Response(body.stream).arrayBuffer().then((bytes) => new Uint8Array(bytes)),
+            `ZIP entry ${visited + 1}: ${path}`,
+          ).resolves.toEqual(expected.data);
+        }
+        visited += 1;
+      }
+      expect(visited).toBe(files.length);
+      expect(input.abort).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["stored", "deflate"] as const)(
+    "validates a later %s data-descriptor CRC after earlier extracted and skipped files",
+    async (compression) => {
+      const archive = makeZip([
+        { path: "opened.txt", data: "already extracted", compression: "deflate" },
+        { path: "skipped.txt", data: "already skipped" },
+        { path: "late.txt", data: "late payload with a corrupted descriptor", compression },
+      ]);
+      const view = new DataView(archive.buffer, archive.byteOffset, archive.byteLength);
+      const centralOffset = view.getUint32(zipEocdOffset(archive) + 16, true);
+      const descriptorOffset = centralOffset - 16;
+      expect(view.getUint32(descriptorOffset, true)).toBe(0x08074b50);
+      view.setUint32(descriptorOffset + 4, view.getUint32(descriptorOffset + 4, true) ^ 1, true);
+
+      const input = testByteStream(archive, 17);
+      const iterator = new ZipAdapter().entries(input.byteStream, { listMode: true })[Symbol.asyncIterator]();
+      try {
+        const first = await iterator.next();
+        if (first.done) throw new Error("expected first ZIP entry");
+        await expect(readText(await first.value.open())).resolves.toBe("already extracted");
+        const second = await iterator.next();
+        if (second.done) throw new Error("expected skipped ZIP entry");
+        await second.value.skip();
+        const third = await iterator.next();
+        if (third.done) throw new Error("expected final ZIP entry");
+        await expect(readText(await third.value.open())).rejects.toMatchObject({
+          code: "CORRUPT_ARCHIVE",
+          details: { path: "late.txt" },
+        });
+        await expect(iterator.next()).rejects.toMatchObject({ code: "CORRUPT_ARCHIVE" });
+        expect(input.abort).toHaveBeenCalled();
+      } finally {
+        await iterator.return?.();
+      }
+    },
+  );
+
+  it("cancels a later open entry after earlier extraction and skip without consuming the archive", async () => {
+    const archive = makeZip([
+      { path: "opened.txt", data: "already extracted", compression: "deflate" },
+      { path: "skipped.txt", data: "already skipped" },
+      { path: "cancelled.bin", data: new Uint8Array(512 * 1024).fill(97) },
+      { path: "unread.txt", data: "never extracted" },
+    ]);
+    const chunkSize = 4096;
+    const input = testByteStream(archive, chunkSize);
+    const iterator = new ZipAdapter().entries(input.byteStream, { listMode: true })[Symbol.asyncIterator]();
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    try {
+      const first = await iterator.next();
+      if (first.done) throw new Error("expected first ZIP entry");
+      await expect(readText(await first.value.open())).resolves.toBe("already extracted");
+      const second = await iterator.next();
+      if (second.done) throw new Error("expected skipped ZIP entry");
+      await second.value.skip();
+      const third = await iterator.next();
+      if (third.done) throw new Error("expected cancellable ZIP entry");
+      const body = await third.value.open();
+      reader = body.stream.getReader();
+      const chunk = await reader.read();
+      expect(chunk.done).toBe(false);
+      expect(chunk.value?.every((byte) => byte === 97)).toBe(true);
+      body.abort("consumer disconnected");
+      await reader.cancel("consumer disconnected");
+      expect(input.abort).toHaveBeenCalledWith("consumer disconnected");
+    } finally {
+      reader?.releaseLock();
+      await iterator.return?.();
+    }
+    expect(input.pulls()).toBeLessThan(Math.ceil(archive.byteLength / chunkSize));
+    expect(input.byteStream.stream.locked).toBe(false);
+    const pullsAfterCleanup = input.pulls();
+    await Promise.resolve();
+    expect(input.pulls()).toBe(pullsAfterCleanup);
+  });
+
   it("classifies a trailing-slash entry as a directory", async () => {
     const entries = await listEntries(
       new ZipAdapter(),
