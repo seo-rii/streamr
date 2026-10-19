@@ -57,7 +57,7 @@ function ensureImageData(): void {
 async function useCodec<T, R>(
   factory: CodecFactory<T>,
   module: WebAssembly.Module,
-  operation: (codec: T) => R,
+  operation: (codec: T, memory: WebAssembly.Memory) => R,
 ): Promise<R> {
   ensureImageData();
   let memory: WebAssembly.Memory | undefined;
@@ -78,7 +78,8 @@ async function useCodec<T, R>(
         return instance.exports;
       },
     });
-    return operation(codec);
+    if (memory === undefined) throw new Error("Image codec memory is unavailable.");
+    return operation(codec, memory);
   } finally {
     // No cached factory promises or Wasm instances: every image starts clean.
     // Clear both allocated and freed codec buffers before allowing collection.
@@ -302,11 +303,14 @@ export async function decodeImage(input: Uint8Array, format: ImageFormat): Promi
     }
   }
   if (format === "webp") return useWebpCodec(webpDecoderModule, (codec) => codec.decode(input));
-  return useCodec(createJpegDecoder as CodecFactory<Decoder>, jpegDecoderModule, (codec) => {
+  return useCodec(createJpegDecoder as CodecFactory<Decoder>, jpegDecoderModule, (codec, memory) => {
     // The oddly named preserveOrientation=true option applies an EXIF rotation.
     // The image transform handles orientation consistently across all formats.
     const pixels = codec.decode(input, false);
     if (pixels === null) throw new Error("Image decoding failed.");
+    // jSquash normally returns owned JS pixels. Only heap views need copying
+    // before useCodec clears the fresh instance's entire linear memory.
+    if (pixels.data.buffer !== memory.buffer) return pixels;
     const result = { data: pixels.data.slice(), width: pixels.width, height: pixels.height };
     pixels.data.fill(0);
     return result;
@@ -329,9 +333,10 @@ export async function encodeImage(
   }
   if (format === "webp") return useWebpCodec(webpEncoderModule, (codec) => codec.encode(pixels, quality));
   const options = { ...jpegOptions, quality, baseline: true, progressive: false };
-  return useCodec(createJpegEncoder as CodecFactory<Encoder>, jpegEncoderModule, (codec) => {
+  return useCodec(createJpegEncoder as CodecFactory<Encoder>, jpegEncoderModule, (codec, memory) => {
     const result = codec.encode(pixels.data, pixels.width, pixels.height, options);
     if (result === null || result.byteLength === 0) throw new Error("Image encoding failed.");
+    if (result.buffer !== memory.buffer) return result;
     const encoded = result.slice();
     result.fill(0);
     return encoded;

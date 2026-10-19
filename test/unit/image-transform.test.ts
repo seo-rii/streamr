@@ -68,6 +68,19 @@ describe("bounded Worker-local WASM image transform", () => {
     expect(imageDimensions(decoded)).toEqual({ format: "png", width: 16, height: 8 });
   });
 
+  it("keeps JPEG bytes usable across repeated fresh encoder and decoder operations", async () => {
+    let jpeg = await readBytes(await transformImage(input([makePng()]), spec({ format: "jpeg" })));
+    const retained = jpeg.slice();
+    const first = jpeg;
+    for (let index = 0; index < 3; index += 1) {
+      jpeg = await readBytes(await transformImage(input([jpeg], jpeg.byteLength), spec({ format: "jpeg" })));
+      const png = await readBytes(await transformImage(input([jpeg]), spec({ format: "png" })));
+      expect(imageDimensions(png)).toEqual({ format: "png", width: 16, height: 8 });
+      expect(pngPixel(png, 7, 3)[3]).toBe(255);
+      expect(first).toEqual(retained);
+    }
+  });
+
   it("decodes real lossless VP8L WebP pixels including transparency", async () => {
     const fixture = makeLosslessWebp();
     expect(new TextDecoder().decode(fixture.subarray(12, 16))).toBe("VP8L");
